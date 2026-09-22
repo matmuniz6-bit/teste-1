@@ -92,6 +92,12 @@ def create_trading_universe(
         universe_options=universe_options,
         pairs=pair_df,
         required_history_period=datetime.timedelta(hours=2),
+        reserve_asset=QUOTE_TOKEN,
+        # The native backtest pricing model asks candle lookups to explicitly
+        # ignore synthetic forward-filled rows. Enabling forward fill here
+        # guarantees the candle frame carries the "forward_filled" marker even
+        # when this liquid pool has no gaps in the requested period.
+        forward_fill=True,
     )
 
     return TradingStrategyUniverse.create_from_dataset(dataset)
