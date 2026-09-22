@@ -8,6 +8,8 @@ from typing import Literal
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
+
+from market_data import resolve_pair_lightweight
 from pydantic import BaseModel, Field
 
 
@@ -172,18 +174,16 @@ def capabilities():
 def trading_strategy_selftest():
     try:
         from tradingstrategy.chain import ChainId
-        from tradingstrategy.pair import PandasPairUniverse
         from tradingstrategy.timebucket import TimeBucket
 
         client = _get_ts_client()
-        exchange_universe = client.fetch_exchange_universe()
-        pairs_df = client.fetch_pair_universe().to_pandas()
-        pair_universe = PandasPairUniverse(
-            pairs_df,
-            exchange_universe=exchange_universe,
-        )
-        pair = pair_universe.get_pair_by_human_description(
-            (ChainId.ethereum, "uniswap-v3", "WETH", "USDC", 0.0005)
+        pair = resolve_pair_lightweight(
+            client,
+            chain_id=ChainId.ethereum,
+            exchange_slug="uniswap-v3",
+            base_token="WETH",
+            quote_token="USDC",
+            fee_tier=0.0005,
         )
 
         start = datetime(2024, 1, 1)
@@ -251,18 +251,19 @@ def native_backtest(req: NativeBacktestRequest):
         chain_id = _chain_id(req.chain)
         bucket = _time_bucket(req.time_bucket)
 
-        if req.exchange != "uniswap-v3":
-            raise HTTPException(status_code=400, detail="Initial native endpoint supports uniswap-v3 only")
-        if req.quote.upper() != "USDC":
-            raise HTTPException(status_code=400, detail="Initial native endpoint supports USDC reserve only")
+        if (
+            req.chain.lower() != "ethereum"
+            or req.exchange != "uniswap-v3"
+            or req.base.upper() != "WETH"
+            or req.quote.upper() != "USDC"
+            or abs(req.fee_tier - 0.0005) > 1e-12
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Initial native endpoint supports only Ethereum / uniswap-v3 / WETH-USDC / 0.0005",
+            )
 
         route = TradeRouting.uniswap_v3_usdc
-        if req.chain.lower() == "polygon":
-            route = TradeRouting.uniswap_v3_usdc_poly
-        elif req.chain.lower() == "base":
-            route = TradeRouting.uniswap_v3_usdc_base
-        elif req.chain.lower() == "arbitrum":
-            route = TradeRouting.uniswap_v3_usdc_arbitrum_native
 
         result = run_backtest_for_module(
             strategy_file=STRATEGY_FILE,
