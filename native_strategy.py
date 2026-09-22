@@ -26,6 +26,8 @@ from tradeexecutor.strategy.strategy_type import StrategyType
 from tradeexecutor.strategy.trading_strategy_universe import TradingStrategyUniverse, load_partial_data
 from tradeexecutor.strategy.universe_model import UniverseOptions
 
+from market_data import resolve_pair_dataframe
+
 
 trading_strategy_engine_version = "0.3"
 trading_strategy_type = StrategyType.managed_positions
@@ -74,14 +76,21 @@ def create_trading_universe(
     execution_context: ExecutionContext,
     universe_options: UniverseOptions,
 ) -> TradingStrategyUniverse:
-    pair = (CHAIN_ID, EXCHANGE_SLUG, BASE_TOKEN, QUOTE_TOKEN, FEE_TIER)
+    _, pair_df = resolve_pair_dataframe(
+        client,
+        chain_id=CHAIN_ID,
+        exchange_slug=EXCHANGE_SLUG,
+        base_token=BASE_TOKEN,
+        quote_token=QUOTE_TOKEN,
+        fee_tier=FEE_TIER,
+    )
 
     dataset = load_partial_data(
         client,
         execution_context=execution_context,
         time_bucket=CANDLE_TIME_BUCKET,
         universe_options=universe_options,
-        pairs=[pair],
+        pairs=pair_df,
         required_history_period=datetime.timedelta(hours=2),
     )
 
