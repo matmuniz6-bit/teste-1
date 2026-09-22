@@ -92,9 +92,12 @@ def create_trading_universe(
         universe_options=universe_options,
         pairs=pair_df,
         required_history_period=datetime.timedelta(hours=2),
-        # trade-executor 0.3.2 supports forward_fill here, but not reserve_asset.
-        # The pricing model expects a forward_filled marker column to exist.
-        forward_fill=True,
     )
 
-    return TradingStrategyUniverse.create_from_dataset(dataset)
+    # In trade-executor 0.3.2 forward-fill configuration belongs to the
+    # TradingStrategyUniverse constructor, not load_partial_data().
+    return TradingStrategyUniverse.create_from_dataset(
+        dataset,
+        reserve_asset=QUOTE_TOKEN,
+        forward_fill=True,
+    )
