@@ -168,6 +168,7 @@ def capabilities():
 
 
 @api.get("/selftest/trading-strategy")
+@api.get("/selftest/trading_strategy")
 def trading_strategy_selftest():
     try:
         from tradingstrategy.chain import ChainId
@@ -361,6 +362,7 @@ def demeter_selftest():
 
 
 @api.get("/selftest/native-backtest")
+@api.get("/selftest/native_backtest")
 def native_backtest_selftest():
     """Run the default native trade-executor + Trading Strategy backtest smoke test."""
     return native_backtest(NativeBacktestRequest())
