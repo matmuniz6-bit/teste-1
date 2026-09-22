@@ -358,3 +358,9 @@ def demeter_selftest():
             status_code=500,
             detail=f"Demeter adapter import failed: {type(exc).__name__}: {exc}",
         ) from exc
+
+
+@api.get("/selftest/native-backtest")
+def native_backtest_selftest():
+    """Run the default native trade-executor + Trading Strategy backtest smoke test."""
+    return native_backtest(NativeBacktestRequest())
