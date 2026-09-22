@@ -1,81 +1,360 @@
-import os,sys,math
-from datetime import datetime,timezone
-from typing import List,Literal
-import numpy as np
-from fastapi import FastAPI,HTTPException
-from pydantic import BaseModel,Field
-imports={}
-for n in ("tradeexecutor","eth_defi","demeter"):
+import importlib
+import importlib.metadata
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
+
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+
+API_VERSION = "0.2.0"
+CACHE_PATH = Path("/tmp/tradingstrategy-cache")
+STRATEGY_FILE = Path("/app/native_strategy.py")
+
+api = FastAPI(title="DeFi Simulator", version=API_VERSION)
+
+
+def _version(*names: str) -> str | None:
+    for name in names:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    return None
+
+
+def _module_status(module_name: str, *dist_names: str) -> dict:
     try:
-        m=__import__(n); imports[n]={"ok":True,"path":getattr(m,"__file__",None)}
-    except Exception as e: imports[n]={"ok":False,"error":f"{type(e).__name__}: {e}"}
-api=FastAPI(title="DeFi Simulator",version="0.1.0")
-class P(BaseModel):
-    timestamp:str
-    price:float=Field(gt=0)
-class R(BaseModel):
-    initial_capital:float=Field(gt=0)
-    prices:List[P]
-    strategy:Literal["buy_and_hold","periodic_rebalance"]="buy_and_hold"
-    fee_bps:float=Field(default=0,ge=0)
-    slippage_bps:float=Field(default=0,ge=0)
-    gas_cost_per_trade:float=Field(default=0,ge=0)
-    rebalance_every:int=Field(default=24,ge=1)
-def ts(s):
+        module = importlib.import_module(module_name)
+        return {
+            "importable": True,
+            "version": _version(*dist_names) or getattr(module, "__version__", None),
+            "path": getattr(module, "__file__", None),
+        }
+    except Exception as exc:
+        return {
+            "importable": False,
+            "version": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _engine_status() -> dict:
+    return {
+        "tradeexecutor": _module_status("tradeexecutor", "trade-executor"),
+        "eth_defi": _module_status("eth_defi", "web3-ethereum-defi"),
+        "tradingstrategy": _module_status("tradingstrategy", "trading-strategy"),
+        "demeter": _module_status("demeter", "zelos-demeter", "demeter"),
+    }
+
+
+def _api_key_is_configured() -> bool:
+    return bool(os.environ.get("TRADING_STRATEGY_API_KEY"))
+
+
+def _get_ts_client():
+    if not _api_key_is_configured():
+        raise HTTPException(status_code=503, detail="Trading Strategy API key is not configured")
+
     try:
-        d=datetime.fromisoformat(s.replace("Z","+00:00"))
-        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-    except: raise HTTPException(400,f"Invalid timestamp: {s}")
-def cf(r): return (r.fee_bps+r.slippage_bps)/10000.0
-def buy(c,p,r):
-    g=r.gas_cost_per_trade
-    if c<=g: raise HTTPException(400,"Gas cost >= available cash")
-    f=cf(r); u=(c-g)/(p*(1+f)); return u,0.0,g+u*p*f
-def sell(u,p,r):
-    f=cf(r); gross=u*p; cost=gross*f+r.gas_cost_per_trade; c=gross-cost
-    if c<0: raise HTTPException(400,"Trading costs exceed proceeds")
-    return 0.0,c,cost
+        from tradingstrategy.client import Client
+        return Client.create_live_client(
+            api_key=os.environ["TRADING_STRATEGY_API_KEY"],
+            cache_path=CACHE_PATH,
+            settings_path=None,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Trading Strategy client initialisation failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+def _parse_dt(value: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid datetime: {value}") from exc
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _time_bucket(value: str):
+    from tradingstrategy.timebucket import TimeBucket
+
+    aliases = {
+        "1m": TimeBucket.m1,
+        "5m": TimeBucket.m5,
+        "15m": TimeBucket.m15,
+        "1h": TimeBucket.h1,
+        "4h": TimeBucket.h4,
+        "1d": TimeBucket.d1,
+    }
+    if value not in aliases:
+        raise HTTPException(status_code=400, detail=f"Unsupported time bucket: {value}")
+    return aliases[value]
+
+
+def _chain_id(value: str):
+    from tradingstrategy.chain import ChainId
+
+    aliases = {
+        "ethereum": ChainId.ethereum,
+        "polygon": ChainId.polygon,
+        "arbitrum": ChainId.arbitrum,
+        "base": ChainId.base,
+    }
+    if value.lower() not in aliases:
+        raise HTTPException(status_code=400, detail=f"Unsupported chain: {value}")
+    return aliases[value.lower()]
+
+
+class NativeBacktestRequest(BaseModel):
+    chain: str = "ethereum"
+    exchange: str = "uniswap-v3"
+    base: str = "WETH"
+    quote: str = "USDC"
+    fee_tier: float = Field(default=0.0005, gt=0)
+    start: str = "2024-01-01T00:00:00Z"
+    end: str = "2024-01-08T00:00:00Z"
+    time_bucket: Literal["1h"] = "1h"
+    initial_capital: float = Field(default=10_000, gt=0)
+    strategy: Literal["buy_and_hold"] = "buy_and_hold"
+    position_size: float = Field(default=0.99, gt=0, le=1)
+
+
 @api.get("/health")
-def health(): return {"status":"ok","python":sys.version.split()[0],"imports":imports}
+def health():
+    engines = _engine_status()
+    imports_ok = all(item["importable"] for item in engines.values())
+    return {
+        "status": "ok" if imports_ok and _api_key_is_configured() else "degraded",
+        "api_version": API_VERSION,
+        "python": sys.version.split()[0],
+        "engines": engines,
+        "integration": {
+            "all_engines_importable": imports_ok,
+            "trading_strategy_auth": "configured" if _api_key_is_configured() else "missing",
+            "native_strategy_file": STRATEGY_FILE.exists(),
+        },
+    }
+
+
 @api.get("/capabilities")
-def caps():
-    return {"strategies":["buy_and_hold","periodic_rebalance"],
-            "metrics":["final_value","total_return_pct","max_drawdown_pct","annualized_volatility_pct","sharpe_ratio","trade_count","total_costs","equity_curve"],
-            "defi_engines":imports,
-            "protocol_native":{"uniswap_v3":False,"aave_v3":False}}
-@api.post("/backtest")
-def backtest(r:R):
-    if len(r.prices)<2: raise HTTPException(400,"Need at least 2 observations")
-    raw=[(ts(x.timestamp),float(x.price)) for x in r.prices]
-    orig=[x[0] for x in raw]; raw.sort(key=lambda x:x[0]); sorted_input=orig!=[x[0] for x in raw]
-    t=[x[0] for x in raw]; p=np.array([x[1] for x in raw],float)
-    if not np.isfinite(p).all() or (p<=0).any(): raise HTTPException(400,"Prices must be finite and > 0")
-    ds=[(t[i]-t[i-1]).total_seconds() for i in range(1,len(t))]
-    med=float(np.median(ds))
-    if med<=0: raise HTTPException(400,"Timestamps must increase")
-    opy=(365*24*3600)/med
-    cash=float(r.initial_capital); units=0.0; trades=0; costs=0.0; curve=[]
-    for i,(tt,pp) in enumerate(zip(t,p)):
-        if r.strategy=="buy_and_hold":
-            if i==0: units,cash,c=buy(cash,pp,r); costs+=c; trades+=1
-            if i==len(p)-1: units,cash,c=sell(units,pp,r); costs+=c; trades+=1
-        else:
-            if i==0: units,cash,c=buy(cash,pp,r); costs+=c; trades+=1
-            elif i<len(p)-1 and i%r.rebalance_every==0:
-                units,cash,c=sell(units,pp,r); costs+=c; trades+=1
-                units,cash,c=buy(cash,pp,r); costs+=c; trades+=1
-            if i==len(p)-1: units,cash,c=sell(units,pp,r); costs+=c; trades+=1
-        eq=cash+units*pp; curve.append({"timestamp":tt.isoformat(),"equity":round(float(eq),8)})
-    e=np.array([x["equity"] for x in curve],float); final=float(e[-1]); tr=final/r.initial_capital-1
-    dd=e/np.maximum.accumulate(e)-1; mdd=float(dd.min())
-    rets=e[1:]/e[:-1]-1
-    vol=float(np.std(rets,ddof=1)*math.sqrt(opy)) if len(rets)>1 else 0.0
-    mean=float(np.mean(rets)*opy) if len(rets) else 0.0; sharpe=mean/vol if vol>0 else 0.0
-    return {"final_value":round(final,8),"total_return_pct":round(tr*100,6),
-            "max_drawdown_pct":round(mdd*100,6),"annualized_volatility_pct":round(vol*100,6),
-            "sharpe_ratio":round(sharpe,6),"trade_count":trades,"total_costs":round(costs,8),
-            "equity_curve":curve,
-            "assumptions":{"sequential_no_lookahead":True,"sorted_input":sorted_input,
-            "median_interval_seconds":med,"observations_per_year":opy,"risk_free_rate":0.0,
-            "fee_bps":r.fee_bps,"slippage_bps":r.slippage_bps,"gas_cost_per_trade":r.gas_cost_per_trade,
-            "rebalance_every":r.rebalance_every}}
+def capabilities():
+    return {
+        "market_data": {
+            "trading_strategy": True,
+            "ohlcv": True,
+            "clmm": True,
+            "lending": True,
+        },
+        "backtesting": {
+            "trade_executor_native": True,
+            "strategies": ["buy_and_hold"],
+            "no_lookahead": True,
+        },
+        "defi_simulation": {
+            "demeter_adapter_importable": _engine_status()["demeter"]["importable"],
+            "uniswap_v3": "adapter_next",
+            "aave_v3": "adapter_next",
+        },
+    }
+
+
+@api.get("/selftest/trading-strategy")
+def trading_strategy_selftest():
+    try:
+        from tradingstrategy.chain import ChainId
+        from tradingstrategy.pair import PandasPairUniverse
+        from tradingstrategy.timebucket import TimeBucket
+
+        client = _get_ts_client()
+        exchange_universe = client.fetch_exchange_universe()
+        pairs_df = client.fetch_pair_universe().to_pandas()
+        pair_universe = PandasPairUniverse(
+            pairs_df,
+            exchange_universe=exchange_universe,
+        )
+        pair = pair_universe.get_pair_by_human_description(
+            (ChainId.ethereum, "uniswap-v3", "WETH", "USDC", 0.0005)
+        )
+
+        start = datetime(2024, 1, 1)
+        end = datetime(2024, 1, 2)
+        candles = client.fetch_candles_by_pair_ids(
+            [pair.pair_id],
+            TimeBucket.h1,
+            start_time=start,
+            end_time=end,
+            progress_bar_description="DeFi simulator self-test",
+        )
+
+        safe_cols = [
+            col for col in ("timestamp", "open", "high", "low", "close", "volume")
+            if col in candles.columns
+        ]
+        sample = candles[safe_cols].head(3).copy()
+        if "timestamp" in sample.columns:
+            sample["timestamp"] = sample["timestamp"].astype(str)
+
+        return {
+            "status": "ok",
+            "authenticated": True,
+            "pair": {
+                "pair_id": int(pair.pair_id),
+                "chain": "ethereum",
+                "exchange": pair.exchange_slug,
+                "base": pair.base_token_symbol,
+                "quote": pair.quote_token_symbol,
+                "fee_tier": float(pair.fee_tier),
+            },
+            "bucket": "1h",
+            "requested_range": {"start": start.isoformat(), "end": end.isoformat()},
+            "rows": int(len(candles)),
+            "sample": sample.to_dict(orient="records"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Trading Strategy self-test failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@api.post("/backtest/native")
+def native_backtest(req: NativeBacktestRequest):
+    if not STRATEGY_FILE.exists():
+        raise HTTPException(status_code=500, detail="Native strategy file is missing")
+    if not _api_key_is_configured():
+        raise HTTPException(status_code=503, detail="Trading Strategy API key is not configured")
+
+    start = _parse_dt(req.start)
+    end = _parse_dt(req.end)
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end must be after start")
+    if (end - start).days > 31:
+        raise HTTPException(status_code=400, detail="Initial native endpoint is limited to 31 days per run")
+
+    try:
+        from tradeexecutor.backtest.backtest_module import run_backtest_for_module
+        from tradeexecutor.strategy.default_routing_options import TradeRouting
+        from tradeexecutor.strategy.reserve_currency import ReserveCurrency
+
+        chain_id = _chain_id(req.chain)
+        bucket = _time_bucket(req.time_bucket)
+
+        if req.exchange != "uniswap-v3":
+            raise HTTPException(status_code=400, detail="Initial native endpoint supports uniswap-v3 only")
+        if req.quote.upper() != "USDC":
+            raise HTTPException(status_code=400, detail="Initial native endpoint supports USDC reserve only")
+
+        route = TradeRouting.uniswap_v3_usdc
+        if req.chain.lower() == "polygon":
+            route = TradeRouting.uniswap_v3_usdc_poly
+        elif req.chain.lower() == "base":
+            route = TradeRouting.uniswap_v3_usdc_base
+        elif req.chain.lower() == "arbitrum":
+            route = TradeRouting.uniswap_v3_usdc_arbitrum_native
+
+        result = run_backtest_for_module(
+            strategy_file=STRATEGY_FILE,
+            cache_path=CACHE_PATH,
+            trading_strategy_api_key=None,
+            verbose=False,
+            max_workers=1,
+            mod_overrides={
+                "CHAIN_ID": chain_id,
+                "EXCHANGE_SLUG": req.exchange,
+                "BASE_TOKEN": req.base.upper(),
+                "QUOTE_TOKEN": req.quote.upper(),
+                "FEE_TIER": req.fee_tier,
+                "CANDLE_TIME_BUCKET": bucket,
+                "trading_strategy_cycle": {
+                    "1h": importlib.import_module("tradeexecutor.strategy.cycle").CycleDuration.cycle_1h,
+                }[req.time_bucket],
+                "trade_routing": route,
+                "reserve_currency": ReserveCurrency.usdc,
+                "backtest_start": start,
+                "backtest_end": end,
+                "initial_cash": req.initial_capital,
+                "POSITION_SIZE": req.position_size,
+            },
+        )
+
+        state = result.state
+        universe = result.strategy_universe
+        portfolio = state.portfolio
+        final_value = float(portfolio.get_net_asset_value())
+        trades = list(portfolio.get_all_trades())
+
+        candle_range = universe.data_universe.candles.get_timestamp_range()
+        pair = universe.data_universe.pairs.get_single()
+
+        return {
+            "status": "ok",
+            "engine": "trade-executor",
+            "data_source": "Trading Strategy",
+            "strategy": req.strategy,
+            "no_lookahead": True,
+            "request": req.model_dump(),
+            "resolved_pair": {
+                "pair_id": int(pair.pair_id),
+                "exchange": pair.exchange_slug,
+                "base": pair.base_token_symbol,
+                "quote": pair.quote_token_symbol,
+                "fee_tier": float(pair.fee_tier),
+            },
+            "dataset": {
+                "candle_range": [str(candle_range[0]), str(candle_range[1])],
+                "time_bucket": req.time_bucket,
+            },
+            "result": {
+                "initial_capital": req.initial_capital,
+                "final_value": final_value,
+                "total_return_pct": (final_value / req.initial_capital - 1.0) * 100.0,
+                "trade_count": len(trades),
+                "open_positions": len(portfolio.open_positions),
+                "closed_positions": len(portfolio.closed_positions),
+                "cash": float(portfolio.get_cash()),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Native trade-executor backtest failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@api.get("/selftest/demeter")
+def demeter_selftest():
+    """Verify the official trade-executor -> Demeter adapter imports in this runtime."""
+    try:
+        from tradeexecutor.strategy.demeter.adapter import (
+            load_clmm_data_to_uni_lp_market,
+            to_demeter_token,
+            to_demeter_uniswap_v3_pool,
+        )
+        return {
+            "status": "ok",
+            "adapter": "tradeexecutor.strategy.demeter.adapter",
+            "functions": [
+                to_demeter_token.__name__,
+                to_demeter_uniswap_v3_pool.__name__,
+                load_clmm_data_to_uni_lp_market.__name__,
+            ],
+            "clmm_execution": "not_run",
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Demeter adapter import failed: {type(exc).__name__}: {exc}",
+        ) from exc
