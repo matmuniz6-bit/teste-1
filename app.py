@@ -456,6 +456,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         if ts_col not in q.columns:
             raise RuntimeError("CLMM data has no bucket/timestamp column")
         q["timestamp"] = pd.to_datetime(q[ts_col], utc=True).dt.tz_convert(None)
+        q = q.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
         for col in (
             "current_liquidity", "high_tick", "low_tick",
             "in_amount0", "in_amount1", "net_amount0", "net_amount1",
