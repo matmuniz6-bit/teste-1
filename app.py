@@ -163,7 +163,7 @@ def capabilities():
         },
         "defi_simulation": {
             "demeter_adapter_importable": _engine_status()["demeter"]["importable"],
-            "uniswap_v3": "adapter_next",
+            "uniswap_v3": "clmm_adapter",
             "aave_v3": "adapter_next",
         },
     }
@@ -345,27 +345,92 @@ def native_backtest(req: NativeBacktestRequest):
 
 @api.get("/selftest/demeter")
 def demeter_selftest():
-    """Verify the official trade-executor -> Demeter adapter imports in this runtime."""
+    """Load real Trading Strategy CLMM data through the official Demeter adapter."""
     try:
+        from demeter import MarketInfo
+        from demeter.uniswap import UniLpMarket
+        from tradingstrategy.chain import ChainId
+        from tradingstrategy.timebucket import TimeBucket
         from tradeexecutor.strategy.demeter.adapter import (
             load_clmm_data_to_uni_lp_market,
-            to_demeter_token,
             to_demeter_uniswap_v3_pool,
         )
+
+        client = _get_ts_client()
+        pair = resolve_pair_lightweight(
+            client,
+            chain_id=ChainId.ethereum,
+            exchange_slug="uniswap-v3",
+            base_token="WETH",
+            quote_token="USDC",
+            fee_tier=0.0005,
+        )
+
+        start = datetime(2024, 1, 1)
+        fetch_end = datetime(2024, 1, 2)
+        clmm = client.fetch_clmm_liquidity_provision_candles_by_pair_ids(
+            [pair.pair_id],
+            TimeBucket.m1,
+            start_time=start,
+            end_time=fetch_end,
+            progress_bar_description="DeFi simulator Demeter self-test",
+        )
+        if clmm is None or len(clmm) == 0:
+            raise RuntimeError("Trading Strategy returned no CLMM rows")
+
+        pool = to_demeter_uniswap_v3_pool(pair)
+        market = UniLpMarket(MarketInfo("weth_usdc_5bps"), pool)
+
+        # The adapter expects a full calendar day and fills missing minute rows.
+        load_clmm_data_to_uni_lp_market(
+            market,
+            clmm.copy(),
+            start_date=start,
+            end_date=start,
+        )
+
+        if not isinstance(market.data, pd.DataFrame) or len(market.data) == 0:
+            raise RuntimeError("Demeter market data was not populated")
+
+        price_data = market.get_price_from_data()
+        if price_data is None or len(price_data) == 0:
+            raise RuntimeError("Demeter could not derive prices from CLMM data")
+
         return {
             "status": "ok",
+            "source": "Trading Strategy CLMM",
             "adapter": "tradeexecutor.strategy.demeter.adapter",
-            "functions": [
-                to_demeter_token.__name__,
-                to_demeter_uniswap_v3_pool.__name__,
-                load_clmm_data_to_uni_lp_market.__name__,
-            ],
-            "clmm_execution": "not_run",
+            "pair": {
+                "pair_id": int(pair.pair_id),
+                "chain": "ethereum",
+                "exchange": pair.exchange_slug,
+                "base": pair.base_token_symbol,
+                "quote": pair.quote_token_symbol,
+                "fee_tier": float(pair.fee_tier),
+            },
+            "request": {
+                "bucket": "1m",
+                "start": start.isoformat(),
+                "end": fetch_end.isoformat(),
+            },
+            "clmm_rows": int(len(clmm)),
+            "clmm_columns": [str(col) for col in clmm.columns],
+            "demeter": {
+                "market_type": type(market).__name__,
+                "pool_type": type(pool).__name__,
+                "tick_spacing": int(pool.tick_spacing),
+                "loaded_rows": int(len(market.data)),
+                "data_start": str(market.data.index.min()),
+                "data_end": str(market.data.index.max()),
+                "price_rows": int(len(price_data)),
+            },
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Demeter adapter import failed: {type(exc).__name__}: {exc}",
+            detail=f"Demeter CLMM self-test failed: {type(exc).__name__}: {exc}",
         ) from exc
 
 
