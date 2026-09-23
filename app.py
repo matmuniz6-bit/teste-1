@@ -1044,29 +1044,6 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             frame[f"{prefix}_trigger"] = trig_h
             horizon_prefixes.append(prefix)
 
-        # V8 strategy probe: the new spatial model decides WHEN.
-        # Direction remains the untouched completed-hour momentum so detector
-        # quality can be isolated economically, as requested by the research protocol.
-        v8_state = frame.get(
-            "v8_concentration_state",
-            pd.Series(False, index=frame.index),
-        ).fillna(False).astype(bool)
-        v8_rising = v8_state & (~v8_state.shift(1).fillna(False))
-        v8_pos, v8_trig = _build_event_momentum(v8_rising, hold_hours=3)
-        frame["v8_spatial_momentum_3h_position"] = v8_pos
-        frame["v8_spatial_momentum_3h_trigger"] = v8_trig
-
-        # Severe V8 is a secondary, more selective probe using the causal
-        # 90th-percentile score threshold in addition to the mathematical state.
-        v8_severe = frame.get(
-            "v8_severe_state",
-            pd.Series(False, index=frame.index),
-        ).fillna(False).astype(bool)
-        v8_severe_rising = v8_severe & (~v8_severe.shift(1).fillna(False))
-        v8s_pos, v8s_trig = _build_event_momentum(v8_severe_rising, hold_hours=3)
-        frame["v8_severe_momentum_3h_position"] = v8s_pos
-        frame["v8_severe_momentum_3h_trigger"] = v8s_trig
-
         frame["gross_strategy_ret"] = frame["position"] * frame["simple_ret"]
 
         previous_position = frame["position"].shift(1).fillna(0.0)
@@ -1103,8 +1080,6 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             _apply_probe(f"{prefix}_position", prefix)
         for prefix in horizon_prefixes:
             _apply_probe(f"{prefix}_position", prefix)
-        _apply_probe("v8_spatial_momentum_3h_position", "v8_spatial_momentum_3h")
-        _apply_probe("v8_severe_momentum_3h_position", "v8_severe_momentum_3h")
 
         day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
         needed = [
@@ -1577,47 +1552,6 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 **_probe_result("v4_confirmed_momentum_3h"),
                 "event_triggers": int(day["v4_confirmed_momentum_3h_trigger"].sum()),
             },
-            "v8_spatial_reduced_model": {
-                "status": "primary spatial research strategy",
-                "observation_layer": (
-                    "five-mode fixed log-price Fourier field reconstructed from minute realised tick motion, "
-                    "swap-activity magnitude and active-liquidity normalization"
-                ),
-                "limitation": (
-                    "Trading Strategy CLMM history does not expose the full LP liquidity distribution per initialized tick; "
-                    "therefore the observation field is a causal proxy, while the reduced dynamics enforce the proposed "
-                    "energy-preserving quadratic interaction and non-negative diagonal damping"
-                ),
-                "model": "da/dt = B(a,a) - D a + f, with a^T B(a,a)=0 and D>=0",
-                "mean_covariance": "a=m+w; C=E[ww^T]; second-order covariance closure",
-                "detector": (
-                    "I_new(h)=1/(2h)*log[(E_hat/E)*(ell_eff/ell_eff_hat)], "
-                    "requiring I_new>0, forecast width contraction, and lambda>0"
-                ),
-                "evaluated_hours": int(day["v8_spatial_score"].notna().sum()) if "v8_spatial_score" in day.columns else 0,
-                "concentration_hours": int(day["v8_concentration_state"].fillna(False).sum()) if "v8_concentration_state" in day.columns else 0,
-                "severe_hours": int(day["v8_severe_state"].fillna(False).sum()) if "v8_severe_state" in day.columns else 0,
-                "score_vs_next_abs_return_corr": (
-                    _safe_corr(
-                        day.loc[day["v8_spatial_score"].notna(), "v8_spatial_score"],
-                        day.loc[day["v8_spatial_score"].notna(), "next_abs_log_ret"],
-                    )
-                    if "v8_spatial_score" in day.columns else None
-                ),
-                "mean_lambda": float(day["v8_lambda"].mean()) if "v8_lambda" in day.columns else None,
-                "mean_effective_width": float(day["v8_effective_width"].mean()) if "v8_effective_width" in day.columns else None,
-                "mean_forecast_width": float(day["v8_forecast_width"].mean()) if "v8_forecast_width" in day.columns else None,
-                "momentum_3h_probe": {
-                    **_probe_result("v8_spatial_momentum_3h"),
-                    "cost_sensitivity_bps": _probe_cost_sensitivity("v8_spatial_momentum_3h"),
-                    "event_triggers": int(day["v8_spatial_momentum_3h_trigger"].sum()),
-                },
-                "severe_momentum_3h_probe": {
-                    **_probe_result("v8_severe_momentum_3h"),
-                    "cost_sensitivity_bps": _probe_cost_sensitivity("v8_severe_momentum_3h"),
-                    "event_triggers": int(day["v8_severe_momentum_3h_trigger"].sum()),
-                },
-            },
             "highest_criticality_hours": top_events,
             "daily": daily_rows,
             "monthly": monthly_rows,
@@ -1626,7 +1560,6 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "This is an exploratory financial analogy, not a physical Navier-Stokes solution.",
                 "flow-to-liquidity uses active CLMM liquidity, not the full spatial liquidity-width distribution.",
                 "short exposure is linear mathematical exposure; borrowing/funding/liquidation are not modeled.",
-                "V8 uses a reduced spatial proxy because full historical liquidity-by-tick is not available in the current Trading Strategy CLMM schema.",
                 "the 5 bps cost is illustrative turnover cost and is not a full execution/slippage model.",
                 "no parameters were optimized on the target day.",
             ],
