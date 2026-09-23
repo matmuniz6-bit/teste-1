@@ -1515,6 +1515,13 @@ def ns_instability_older2_12m_selftest():
     )
 
 
+@api.get("/selftest/ns-instability-oldest-12m")
+def ns_instability_oldest_12m_selftest():
+    return ns_criticality_day(
+        NavierStokesDayRequest(date="2021-09-01", days=365)
+    )
+
+
 @api.post("/backtest/long-reversal")
 def long_reversal_backtest(req: LongReversalBacktestRequest):
     """Run the study-like ETH Long/Reversal rule on our WETH/USDC 1h market.
