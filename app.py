@@ -150,6 +150,14 @@ class LongReversalBacktestRequest(BaseModel):
     transaction_costs_bps: list[int] = Field(default_factory=lambda: [0, 1, 2])
 
 
+class NavierStokesDayRequest(BaseModel):
+    """One-day causal Navier-Stokes-inspired market microstructure experiment."""
+
+    date: str = "2026-08-15"
+    integration_gain: float = Field(default=0.10, gt=0, le=1)
+    illustrative_cost_bps_per_turnover: float = Field(default=5.0, ge=0, le=100)
+
+
 @api.get("/health")
 def health():
     engines = _engine_status()
@@ -361,6 +369,319 @@ def native_backtest(req: NativeBacktestRequest):
             status_code=500,
             detail=f"Native trade-executor backtest failed: {type(exc).__name__}: {exc}",
         ) from exc
+
+
+@api.post("/experiment/ns-criticality-day")
+def ns_criticality_day(req: NavierStokesDayRequest):
+    """Causal one-day Navier-Stokes-inspired experiment on WETH/USDC.
+
+    This is an exploratory mapping, not a claim that financial prices obey the
+    physical Navier-Stokes PDE. All variables at hour t only determine the
+    position applied to hour t+1.
+    """
+    try:
+        from tradingstrategy.chain import ChainId
+        from tradingstrategy.timebucket import TimeBucket
+
+        target = pd.Timestamp(req.date)
+        if target.tzinfo is not None:
+            target = target.tz_convert("UTC").tz_localize(None)
+        target = target.floor("D")
+        target_end = target + pd.Timedelta(days=1)
+        fetch_start = target - pd.Timedelta(hours=72)
+        fetch_end = target_end + pd.Timedelta(hours=1)
+
+        client = _get_ts_client()
+        pair = resolve_pair_lightweight(
+            client,
+            chain_id=ChainId.ethereum,
+            exchange_slug="uniswap-v3",
+            base_token="WETH",
+            quote_token="USDC",
+            fee_tier=0.0005,
+        )
+
+        candles = client.fetch_candles_by_pair_ids(
+            [pair.pair_id],
+            TimeBucket.h1,
+            start_time=fetch_start.to_pydatetime(),
+            end_time=fetch_end.to_pydatetime(),
+            progress_bar_description="N-S one-day OHLCV",
+        )
+        if candles is None or len(candles) == 0:
+            raise RuntimeError("No hourly OHLCV data")
+
+        h = candles.copy()
+        if "timestamp" in h.columns:
+            h["timestamp"] = pd.to_datetime(h["timestamp"], utc=True).dt.tz_convert(None)
+        elif isinstance(h.index, pd.DatetimeIndex):
+            h["timestamp"] = pd.to_datetime(h.index, utc=True).tz_convert(None)
+        else:
+            raise RuntimeError("Hourly data has no timestamp")
+        h = h.reset_index(drop=True)
+        for col in ("close", "volume"):
+            h[col] = pd.to_numeric(h[col], errors="coerce")
+        h = (
+            h[["timestamp", "close", "volume"]]
+            .dropna()
+            .sort_values("timestamp")
+            .drop_duplicates("timestamp")
+            .set_index("timestamp")
+        )
+        if h.empty:
+            raise RuntimeError("No usable hourly OHLCV data")
+
+        clmm = client.fetch_clmm_liquidity_provision_candles_by_pair_ids(
+            [pair.pair_id],
+            TimeBucket.m1,
+            start_time=fetch_start.to_pydatetime(),
+            end_time=fetch_end.to_pydatetime(),
+            progress_bar_description="N-S one-day CLMM",
+        )
+        if clmm is None or len(clmm) == 0:
+            raise RuntimeError("No CLMM liquidity data")
+
+        q = clmm.copy()
+        ts_col = "bucket" if "bucket" in q.columns else "timestamp"
+        if ts_col not in q.columns:
+            raise RuntimeError("CLMM data has no bucket/timestamp column")
+        q["timestamp"] = pd.to_datetime(q[ts_col], utc=True).dt.tz_convert(None)
+        for col in ("current_liquidity", "high_tick", "low_tick"):
+            if col in q.columns:
+                q[col] = pd.to_numeric(q[col], errors="coerce")
+        if "current_liquidity" not in q.columns:
+            raise RuntimeError("CLMM data has no current_liquidity")
+
+        agg_map = {"current_liquidity": "median"}
+        if "high_tick" in q.columns and "low_tick" in q.columns:
+            q["tick_span"] = (q["high_tick"] - q["low_tick"]).abs()
+            agg_map["tick_span"] = "median"
+
+        liq = (
+            q.set_index("timestamp")
+            .sort_index()
+            .resample("1h")
+            .agg(agg_map)
+        )
+        frame = h.join(liq, how="inner")
+        frame = frame[
+            (frame.index >= fetch_start)
+            & (frame.index <= target_end)
+        ].copy()
+        if len(frame) < 48:
+            raise RuntimeError(f"Insufficient joined warmup data: {len(frame)} rows")
+
+        eps = 1e-9
+        frame["log_ret"] = np.log(frame["close"]).diff()
+        vol_med = frame["volume"].rolling(24, min_periods=12).median()
+        frame["volume_ratio"] = (frame["volume"] / vol_med.replace(0, np.nan)).clip(0.05, 20.0)
+
+        # u: volume-weighted hourly price velocity, then normalized to local scale.
+        frame["u_raw"] = frame["log_ret"] * np.sqrt(frame["volume_ratio"])
+        u_scale = frame["u_raw"].rolling(24, min_periods=12).std().replace(0, np.nan)
+        frame["u"] = (frame["u_raw"] / u_scale).clip(-8, 8)
+
+        # rho: active Uniswap V3 liquidity around the current tick, normalized
+        # by its trailing 24h median. This is a density proxy, not physical mass.
+        liq_med = frame["current_liquidity"].rolling(24, min_periods=12).median()
+        frame["rho"] = (
+            frame["current_liquidity"] / liq_med.replace(0, np.nan)
+        ).clip(0.10, 10.0)
+
+        # p: local valuation/pressure proxy = displacement from trailing 6h
+        # volume-weighted price. dp is its first difference.
+        pv = (frame["close"] * frame["volume"]).rolling(6, min_periods=3).sum()
+        vv = frame["volume"].rolling(6, min_periods=3).sum().replace(0, np.nan)
+        frame["p"] = np.log(frame["close"] / (pv / vv))
+        frame["dp"] = frame["p"].diff()
+        dp_scale = frame["dp"].rolling(24, min_periods=12).std().replace(0, np.nan)
+        frame["dp_z"] = (frame["dp"] / dp_scale).clip(-8, 8)
+
+        # nu: short-horizon realized volatility relative to its 24h baseline.
+        rv6 = frame["log_ret"].rolling(6, min_periods=3).std()
+        rv24 = frame["log_ret"].rolling(24, min_periods=12).std().replace(0, np.nan)
+        frame["nu"] = (rv6 / rv24).clip(0.10, 5.0)
+
+        frame["du"] = frame["u"].diff()
+        frame["d2u"] = frame["du"].diff()
+
+        # Dimensionless N-S-inspired components on comparable local scales.
+        frame["A_advection"] = -frame["u"] * frame["du"]
+        frame["P_pressure"] = -frame["dp_z"] / frame["rho"].clip(lower=0.25)
+        frame["D_diffusion"] = frame["nu"] * frame["d2u"]
+        frame["net_force"] = (
+            frame["A_advection"] + frame["P_pressure"] + frame["D_diffusion"]
+        )
+
+        # OpenAI-inspired diagnostics: flow/load concentration, nonlinear
+        # amplification vs diffusion, and hidden stress from term cancellation.
+        frame["flow_to_liquidity"] = frame["u"].abs() / frame["rho"].clip(lower=0.10)
+        frame["amplification_minus_damping"] = (
+            (frame["A_advection"] + frame["P_pressure"]).abs()
+            - frame["D_diffusion"].abs()
+        )
+        frame["cancellation_stress"] = (
+            frame["A_advection"].abs()
+            + frame["P_pressure"].abs()
+            + frame["D_diffusion"].abs()
+        ) / (frame["net_force"].abs() + 0.05)
+
+        def rolling_z(s: pd.Series) -> pd.Series:
+            mean = s.rolling(24, min_periods=12).mean()
+            std = s.rolling(24, min_periods=12).std().replace(0, np.nan)
+            return ((s - mean) / std).clip(-6, 6)
+
+        frame["z_concentration"] = rolling_z(frame["flow_to_liquidity"])
+        frame["z_amplification"] = rolling_z(frame["amplification_minus_damping"])
+        frame["z_cancellation"] = rolling_z(np.log1p(frame["cancellation_stress"]))
+        frame["criticality"] = (
+            frame["z_concentration"]
+            + frame["z_amplification"]
+            + frame["z_cancellation"]
+        ) / 3.0
+
+        # Same damped integration spirit as the paper, but fully causal.
+        frame["u_predicted_next"] = (
+            frame["u"] + req.integration_gain * frame["net_force"]
+        )
+        frame["signal_for_next_hour"] = np.sign(frame["u_predicted_next"])
+        frame["position"] = frame["signal_for_next_hour"].shift(1).fillna(0.0)
+        frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
+
+        previous_position = frame["position"].shift(1).fillna(0.0)
+        frame["turnover"] = (frame["position"] - previous_position).abs()
+        cost_rate = req.illustrative_cost_bps_per_turnover / 10_000.0
+        frame["net_strategy_ret"] = (
+            (1.0 + frame["gross_strategy_ret"])
+            * (1.0 - cost_rate * frame["turnover"])
+            - 1.0
+        )
+
+        day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
+        needed = [
+            "u", "rho", "A_advection", "P_pressure", "D_diffusion",
+            "net_force", "flow_to_liquidity", "amplification_minus_damping",
+            "cancellation_stress", "criticality", "u_predicted_next",
+            "position", "log_ret", "gross_strategy_ret", "net_strategy_ret",
+        ]
+        day = day.dropna(subset=needed)
+        if len(day) < 20:
+            raise RuntimeError(f"Only {len(day)} complete experimental hours for target day")
+
+        actual_sign = np.sign(day["log_ret"].to_numpy())
+        pos = day["position"].to_numpy()
+        active = pos != 0
+        direction_accuracy = (
+            float(np.mean(pos[active] == actual_sign[active]) * 100.0)
+            if active.any()
+            else 0.0
+        )
+        gross_total = float(np.exp(day["gross_strategy_ret"].sum()) - 1.0)
+        net_total = float(np.prod(1.0 + day["net_strategy_ret"]) - 1.0)
+        buy_hold = float(np.exp(day["log_ret"].sum()) - 1.0)
+
+        top = (
+            day.sort_values("criticality", ascending=False)
+            .head(5)
+            .sort_index()
+        )
+        top_events = []
+        for ts, row in top.iterrows():
+            top_events.append({
+                "timestamp": str(ts),
+                "criticality": float(row["criticality"]),
+                "u": float(row["u"]),
+                "rho": float(row["rho"]),
+                "flow_to_liquidity": float(row["flow_to_liquidity"]),
+                "amplification_minus_damping": float(row["amplification_minus_damping"]),
+                "cancellation_stress": float(row["cancellation_stress"]),
+                "net_force": float(row["net_force"]),
+                "position_during_hour": int(row["position"]),
+                "hour_return_pct": float((math.exp(row["log_ret"]) - 1.0) * 100.0),
+            })
+
+        hourly = []
+        for ts, row in day.iterrows():
+            hourly.append({
+                "timestamp": str(ts),
+                "price": float(row["close"]),
+                "u": float(row["u"]),
+                "rho": float(row["rho"]),
+                "A": float(row["A_advection"]),
+                "P": float(row["P_pressure"]),
+                "D": float(row["D_diffusion"]),
+                "net_force": float(row["net_force"]),
+                "criticality": float(row["criticality"]),
+                "cancellation_stress": float(row["cancellation_stress"]),
+                "signal_for_next_hour": int(row["signal_for_next_hour"]),
+                "position": int(row["position"]),
+                "hour_return_pct": float((math.exp(row["log_ret"]) - 1.0) * 100.0),
+            })
+
+        return {
+            "status": "ok",
+            "experiment": "Navier-Stokes-inspired endogenous criticality prototype",
+            "date": str(target.date()),
+            "market": {
+                "chain": "ethereum",
+                "exchange": pair.exchange_slug,
+                "pair_id": int(pair.pair_id),
+                "pair": f"{pair.base_token_symbol}/{pair.quote_token_symbol}",
+                "fee_tier": float(pair.fee_tier),
+                "price_bucket": "1h",
+                "liquidity_bucket": "1m aggregated to 1h",
+            },
+            "causality": {
+                "lookahead": False,
+                "rule": "features at hour t determine position for hour t+1",
+                "warmup_hours": 72,
+            },
+            "mapping": {
+                "u": "volume-weighted normalized log-return velocity",
+                "rho": "active CLMM liquidity / trailing 24h median",
+                "p": "log price displacement from trailing 6h volume-weighted price",
+                "nu": "6h realized volatility / 24h realized volatility",
+                "external_force": "omitted in this first endogenous-only prototype",
+                "concentration": "|u| / rho (flow-to-active-liquidity stress)",
+                "amplification": "|A+P| - |D|",
+                "cancellation": "(|A|+|P|+|D|)/(|A+P+D|+epsilon)",
+            },
+            "result": {
+                "complete_hours": int(len(day)),
+                "start_price": float(day["close"].iloc[0]),
+                "end_price": float(day["close"].iloc[-1]),
+                "buy_hold_return_pct": buy_hold * 100.0,
+                "direction_accuracy_pct": direction_accuracy,
+                "gross_strategy_return_pct": gross_total * 100.0,
+                "net_strategy_return_pct": net_total * 100.0,
+                "illustrative_cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
+                "total_turnover": float(day["turnover"].sum()),
+                "mean_criticality": float(day["criticality"].mean()),
+                "max_criticality": float(day["criticality"].max()),
+                "max_cancellation_stress": float(day["cancellation_stress"].max()),
+            },
+            "highest_criticality_hours": top_events,
+            "hourly": hourly,
+            "limitations": [
+                "This is an exploratory financial analogy, not a physical Navier-Stokes solution.",
+                "flow-to-liquidity uses active CLMM liquidity, not the full spatial liquidity-width distribution.",
+                "short exposure is mathematical; borrowing/funding/liquidation are not modeled.",
+                "the 5 bps cost is illustrative turnover cost and is not a full execution/slippage model.",
+                "no parameters were optimized on the target day.",
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"N-S criticality experiment failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@api.get("/selftest/ns-criticality-aug15")
+def ns_criticality_aug15_selftest():
+    return ns_criticality_day(NavierStokesDayRequest())
 
 
 @api.post("/backtest/long-reversal")
