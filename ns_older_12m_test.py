@@ -16,7 +16,7 @@ def main():
         "result": result["result"],
         "v2": result["instability_v2"],
         "v3": result["v3_event_momentum_3h"],
-        "momentum_gates": result["v3_momentum_gate_research"],
+        "v5": result["v5_adaptive_direction"],\n        "momentum_gates": result["v3_momentum_gate_research"],
         "v4_detector": result["instability_v4_spatial"],
         "v4_raw": result["v4_event_momentum_3h"],
         "v4_confirmed": result["v4_confirmed_momentum_3h"],
