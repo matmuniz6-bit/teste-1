@@ -130,6 +130,15 @@ class NativeBacktestRequest(BaseModel):
     position_size: float = Field(default=0.99, gt=0, le=1)
 
 
+class AaveBacktestRequest(BaseModel):
+    start: str = "2024-01-01T00:00:00Z"
+    end: str = "2024-01-02T00:00:00Z"
+    collateral_weth: float = Field(default=1.0, gt=0)
+    borrow_usdc: float = Field(default=500.0, gt=0)
+    initial_weth_balance: float = Field(default=2.0, gt=0)
+    initial_usdc_balance: float = Field(default=10.0, ge=0)
+
+
 @api.get("/health")
 def health():
     engines = _engine_status()
@@ -164,7 +173,7 @@ def capabilities():
         "defi_simulation": {
             "demeter_adapter_importable": _engine_status()["demeter"]["importable"],
             "uniswap_v3": "clmm_adapter",
-            "aave_v3": "lending_smoke_test",
+            "aave_v3": "backtest_endpoint",
         },
     }
 
@@ -434,9 +443,9 @@ def demeter_selftest():
         ) from exc
 
 
-@api.get("/selftest/aave")
-def aave_selftest():
-    """Run a short Aave V3 Demeter simulation using Trading Strategy lending rates."""
+@api.post("/backtest/aave")
+def aave_backtest(req: AaveBacktestRequest):
+    """Run an Aave V3 Demeter simulation using Trading Strategy lending rates."""
     try:
         from decimal import Decimal
         from pathlib import Path as _Path
@@ -448,8 +457,16 @@ def aave_selftest():
         from tradingstrategy.timebucket import TimeBucket
 
         client = _get_ts_client()
-        start = pd.Timestamp("2024-01-01 00:00:00")
-        end = pd.Timestamp("2024-01-02 00:00:00")
+        start = pd.Timestamp(_parse_dt(req.start))
+        end = pd.Timestamp(_parse_dt(req.end))
+        if end <= start:
+            raise HTTPException(status_code=400, detail="end must be after start")
+        if end - start < pd.Timedelta(hours=4):
+            raise HTTPException(status_code=400, detail="Aave backtest requires at least 4 hours")
+        if end - start > pd.Timedelta(days=31):
+            raise HTTPException(status_code=400, detail="Aave backtest is limited to 31 days per run")
+        if req.collateral_weth > req.initial_weth_balance:
+            raise HTTPException(status_code=400, detail="collateral_weth exceeds initial_weth_balance")
 
         reserve_universe = client.fetch_lending_reserve_universe()
         weth_desc = (ChainId.ethereum, LendingProtocolType.aave_v3, "WETH")
@@ -580,7 +597,7 @@ def aave_selftest():
             TimeBucket.h1,
             start_time=start,
             end_time=end,
-            progress_bar_description="Aave self-test WETH price",
+            progress_bar_description="Aave backtest WETH price",
         )
         price_raw = price_raw.copy()
         if "timestamp" in price_raw.columns:
@@ -606,10 +623,10 @@ def aave_selftest():
                 )
 
             def _supply(self, row_data):
-                market.supply(weth, 1.0, True)
+                market.supply(weth, req.collateral_weth, True)
 
             def _borrow(self, row_data):
-                market.borrow(usdc, 500.0)
+                market.borrow(usdc, req.borrow_usdc)
 
             def _repay(self, row_data):
                 for key in list(market.borrow_keys):
@@ -621,8 +638,8 @@ def aave_selftest():
 
         actuator = Actuator()
         actuator.broker.add_market(market)
-        actuator.broker.set_balance(weth, Decimal("2"))
-        actuator.broker.set_balance(usdc, Decimal("10"))
+        actuator.broker.set_balance(weth, Decimal(str(req.initial_weth_balance)))
+        actuator.broker.set_balance(usdc, Decimal(str(req.initial_usdc_balance)))
         actuator.strategy = _AaveSmokeStrategy()
         actuator.set_price(price_df)
         actuator.interval = "1h"
@@ -638,6 +655,8 @@ def aave_selftest():
             "engine": "Demeter AaveV3Market",
             "protocol": "Aave V3",
             "chain": "ethereum",
+            "no_lookahead": True,
+            "request": req.model_dump(),
             "period": {"start": str(start), "end": str(end), "bucket": "1h"},
             "reserves": {
                 "WETH": {
@@ -675,8 +694,14 @@ def aave_selftest():
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Aave V3 self-test failed: {type(exc).__name__}: {exc}",
+            detail=f"Aave V3 backtest failed: {type(exc).__name__}: {exc}",
         ) from exc
+
+
+@api.get("/selftest/aave")
+def aave_selftest():
+    """Run the default short Aave V3 integration smoke test."""
+    return aave_backtest(AaveBacktestRequest())
 
 
 @api.get("/selftest/native-backtest")
