@@ -11,6 +11,7 @@ from app import (
     aave_selftest,
     demeter_selftest,
     health,
+    long_reversal_selftest,
     native_backtest,
     trading_strategy_selftest,
 )
@@ -62,6 +63,19 @@ def main():
         "request": demeter["request"],
         "clmm_rows": demeter["clmm_rows"],
         "demeter": demeter["demeter"],
+    })
+
+    lr = long_reversal_selftest()
+    assert lr["status"] == "ok"
+    assert lr["strategy"]["no_lookahead"] is True
+    assert lr["coverage"]["complete_trading_dates"] >= 28
+    assert set(lr["cost_scenarios"].keys()) == {"0", "1", "2"}
+    assert lr["market"]["base"] == "WETH"
+    assert lr["market"]["quote"] == "USDC"
+    print("SMOKE long_reversal: OK", {
+        "coverage": lr["coverage"],
+        "benchmark": lr["benchmark"],
+        "cost_scenarios": lr["cost_scenarios"],
     })
 
     aave = aave_selftest()
