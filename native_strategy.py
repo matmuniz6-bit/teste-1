@@ -50,14 +50,15 @@ POSITION_SIZE = 0.99
 
 def decide_trades(
     timestamp: pd.Timestamp,
-    universe: Universe,
+    strategy_universe: TradingStrategyUniverse,
     state: State,
     pricing_model: PricingModel,
     cycle_debug_data: Dict,
 ) -> List[TradeExecution]:
     """Open once and hold. The backtest engine values the open position at the end."""
+    universe = strategy_universe.universe
     pair = universe.pairs.get_single()
-    position_manager = PositionManager(timestamp, universe, state, pricing_model)
+    position_manager = PositionManager(timestamp, strategy_universe, state, pricing_model)
 
     if position_manager.is_any_open():
         return []
