@@ -159,6 +159,16 @@ class NavierStokesDayRequest(BaseModel):
     illustrative_cost_bps_per_turnover: float = Field(default=5.0, ge=0, le=100)
 
 
+class SpatialNSV8Request(BaseModel):
+    """Reduced spatial mean/covariance Navier-Stokes-inspired experiment."""
+
+    date: str = "2025-09-01"
+    days: int = Field(default=365, ge=1, le=366)
+    horizon_hours: int = Field(default=3, ge=1, le=12)
+    spatial_bins: int = Field(default=7, ge=5, le=11)
+    illustrative_cost_bps_per_turnover: float = Field(default=5.0, ge=0, le=100)
+
+
 @api.get("/health")
 def health():
     engines = _engine_status()
@@ -370,6 +380,70 @@ def native_backtest(req: NativeBacktestRequest):
             status_code=500,
             detail=f"Native trade-executor backtest failed: {type(exc).__name__}: {exc}",
         ) from exc
+
+
+@api.post("/experiment/ns-spatial-v8")
+def ns_spatial_v8(req: SpatialNSV8Request):
+    """Structure-preserving reduced spatial detector and trading probes."""
+    try:
+        from tradingstrategy.chain import ChainId
+        from spatial_ns_v8 import run_v8_spatial
+
+        target = pd.Timestamp(req.date)
+        if target.tzinfo is not None:
+            target = target.tz_convert("UTC").tz_localize(None)
+
+        client = _get_ts_client()
+        pair = resolve_pair_lightweight(
+            client,
+            chain_id=ChainId.ethereum,
+            exchange_slug="uniswap-v3",
+            base_token="WETH",
+            quote_token="USDC",
+            fee_tier=0.0005,
+        )
+        return run_v8_spatial(
+            client=client,
+            pair=pair,
+            target=target,
+            days=req.days,
+            cost_bps=req.illustrative_cost_bps_per_turnover,
+            horizon=req.horizon_hours,
+            n_bins=req.spatial_bins,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"V8 spatial experiment failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@api.get("/selftest/ns-spatial-v8-12m")
+def ns_spatial_v8_12m_selftest():
+    return ns_spatial_v8(
+        SpatialNSV8Request(
+            date="2025-09-01",
+            days=365,
+            horizon_hours=3,
+            spatial_bins=7,
+            illustrative_cost_bps_per_turnover=5.0,
+        )
+    )
+
+
+@api.get("/selftest/ns-spatial-v8-prior-12m")
+def ns_spatial_v8_prior_12m_selftest():
+    return ns_spatial_v8(
+        SpatialNSV8Request(
+            date="2024-09-01",
+            days=365,
+            horizon_hours=3,
+            spatial_bins=7,
+            illustrative_cost_bps_per_turnover=5.0,
+        )
+    )
 
 
 @api.post("/experiment/ns-criticality-day")
