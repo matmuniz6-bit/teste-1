@@ -1,11 +1,13 @@
 import importlib
 import importlib.metadata
+import math
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 
@@ -139,6 +141,15 @@ class AaveBacktestRequest(BaseModel):
     initial_usdc_balance: float = Field(default=10.0, ge=0)
 
 
+class LongReversalBacktestRequest(BaseModel):
+    """Study-like ETH intraday strategy adapted to our WETH/USDC market."""
+
+    start: str = "2026-08-01T00:00:00Z"
+    end: str = "2026-09-01T00:00:00Z"
+    initial_capital: float = Field(default=10_000, gt=0)
+    transaction_costs_bps: list[int] = Field(default_factory=lambda: [0, 1, 2])
+
+
 @api.get("/health")
 def health():
     engines = _engine_status()
@@ -167,7 +178,7 @@ def capabilities():
         },
         "backtesting": {
             "trade_executor_native": True,
-            "strategies": ["buy_and_hold"],
+            "strategies": ["buy_and_hold", "long_reversal_study_like"],
             "no_lookahead": True,
         },
         "defi_simulation": {
@@ -350,6 +361,285 @@ def native_backtest(req: NativeBacktestRequest):
             status_code=500,
             detail=f"Native trade-executor backtest failed: {type(exc).__name__}: {exc}",
         ) from exc
+
+
+@api.post("/backtest/long-reversal")
+def long_reversal_backtest(req: LongReversalBacktestRequest):
+    """Run the study-like ETH Long/Reversal rule on our WETH/USDC 1h market.
+
+    This intentionally mirrors the paper's core signal and turnover-cost model,
+    while using a mathematical short instead of a margin/perpetual execution venue.
+    """
+    try:
+        from tradingstrategy.chain import ChainId
+        from tradingstrategy.timebucket import TimeBucket
+
+        start = pd.Timestamp(_parse_dt(req.start))
+        end = pd.Timestamp(_parse_dt(req.end))
+        if end <= start:
+            raise HTTPException(status_code=400, detail="end must be after start")
+        if end - start > pd.Timedelta(days=62):
+            raise HTTPException(status_code=400, detail="Long/Reversal endpoint is limited to 62 days per run")
+        if end - start < pd.Timedelta(days=2):
+            raise HTTPException(status_code=400, detail="Long/Reversal backtest requires at least 2 days")
+        if not req.transaction_costs_bps:
+            raise HTTPException(status_code=400, detail="transaction_costs_bps cannot be empty")
+        if any(cost not in (0, 1, 2) for cost in req.transaction_costs_bps):
+            raise HTTPException(
+                status_code=400,
+                detail="Study-like cost scenarios are limited to 0, 1, or 2 bps",
+            )
+
+        client = _get_ts_client()
+        pair = resolve_pair_lightweight(
+            client,
+            chain_id=ChainId.ethereum,
+            exchange_slug="uniswap-v3",
+            base_token="WETH",
+            quote_token="USDC",
+            fee_tier=0.0005,
+        )
+
+        # One full warm-up day is needed to know the previous daytime session
+        # before the first requested trading date.
+        fetch_start = (start - pd.Timedelta(days=1)).to_pydatetime()
+        fetch_end = end.to_pydatetime()
+        candles = client.fetch_candles_by_pair_ids(
+            [pair.pair_id],
+            TimeBucket.h1,
+            start_time=fetch_start,
+            end_time=fetch_end,
+            progress_bar_description="Long/Reversal WETH-USDC backtest",
+        )
+        if candles is None or len(candles) == 0:
+            raise RuntimeError("Trading Strategy returned no WETH/USDC candles")
+
+        x = candles.copy()
+        if "timestamp" in x.columns:
+            x["timestamp"] = pd.to_datetime(x["timestamp"], utc=True).dt.tz_convert(None)
+        elif isinstance(x.index, pd.DatetimeIndex):
+            idx = pd.to_datetime(x.index, utc=True).tz_convert(None)
+            x = x.copy()
+            x["timestamp"] = idx
+        else:
+            raise RuntimeError("Candle dataset has no usable timestamp")
+
+        x["close"] = pd.to_numeric(x["close"], errors="coerce")
+        x = (
+            x[["timestamp", "close"]]
+            .dropna()
+            .sort_values("timestamp")
+            .drop_duplicates("timestamp", keep="last")
+        )
+        x = x[x["close"] > 0].copy()
+        x["bar_ret"] = x["close"].pct_change()
+        x = x.dropna(subset=["bar_ret"]).copy()
+
+        day_start_hour = 5
+        shifted = x["timestamp"] - pd.to_timedelta(day_start_hour, unit="h")
+        x["cycle_start"] = shifted.dt.floor("D") + pd.to_timedelta(day_start_hour, unit="h")
+        x["hours_since_cycle_start"] = (
+            (x["timestamp"] - x["cycle_start"]) / pd.Timedelta(hours=1)
+        ).astype(int)
+        x["session"] = np.where(x["hours_since_cycle_start"] < 12, "day", "night")
+        x["trading_date"] = x["cycle_start"].dt.floor("D")
+        night_mask = x["session"].eq("night")
+        x.loc[night_mask, "trading_date"] = (
+            x.loc[night_mask, "cycle_start"] + pd.Timedelta(days=1)
+        ).dt.floor("D")
+
+        grouped = (
+            x.groupby(["trading_date", "session"], observed=True)
+            .agg(
+                session_ret=("bar_ret", lambda values: (1.0 + values).prod() - 1.0),
+                n_bars=("bar_ret", "size"),
+                first_bar=("timestamp", "min"),
+                last_bar=("timestamp", "max"),
+            )
+            .reset_index()
+        )
+        returns = grouped.pivot(index="trading_date", columns="session", values="session_ret")
+        counts = grouped.pivot(index="trading_date", columns="session", values="n_bars")
+        first_bars = grouped.pivot(index="trading_date", columns="session", values="first_bar")
+        last_bars = grouped.pivot(index="trading_date", columns="session", values="last_bar")
+
+        sessions = pd.DataFrame(index=returns.index).sort_index()
+        sessions["night_ret"] = returns.get("night")
+        sessions["day_ret"] = returns.get("day")
+        sessions["n_night_bars"] = counts.get("night")
+        sessions["n_day_bars"] = counts.get("day")
+        sessions["night_first_bar"] = first_bars.get("night")
+        sessions["night_last_bar"] = last_bars.get("night")
+        sessions["day_first_bar"] = first_bars.get("day")
+        sessions["day_last_bar"] = last_bars.get("day")
+        sessions = sessions[
+            sessions["night_ret"].notna()
+            & sessions["day_ret"].notna()
+            & sessions["n_night_bars"].eq(12)
+            & sessions["n_day_bars"].eq(12)
+        ].copy()
+
+        # Critical anti-lookahead rule from the study: today's daytime reversal
+        # sees only yesterday's daytime return.
+        sessions["previous_day_ret"] = sessions["day_ret"].shift(1)
+        sessions["night_position"] = 1.0
+        sessions["day_position"] = -np.sign(sessions["previous_day_ret"].fillna(0.0))
+
+        start_date = start.floor("D")
+        end_date = end.floor("D")
+        evaluated = sessions[
+            (sessions.index >= start_date) & (sessions.index < end_date)
+        ].copy()
+        if evaluated.empty:
+            raise RuntimeError("No complete 12h/12h trading dates in requested period")
+        if evaluated["previous_day_ret"].isna().any():
+            raise RuntimeError("Warm-up data was insufficient for the first reversal signal")
+
+        positions = np.column_stack(
+            [
+                evaluated["night_position"].to_numpy(dtype=float),
+                evaluated["day_position"].to_numpy(dtype=float),
+            ]
+        ).reshape(-1)
+        realized = np.column_stack(
+            [
+                evaluated["night_ret"].to_numpy(dtype=float),
+                evaluated["day_ret"].to_numpy(dtype=float),
+            ]
+        ).reshape(-1)
+
+        def _max_drawdown(returns_array: np.ndarray) -> float:
+            wealth = np.concatenate(([1.0], np.cumprod(1.0 + returns_array)))
+            peaks = np.maximum.accumulate(wealth)
+            return float(np.min(wealth / peaks - 1.0))
+
+        scenarios = {}
+        for cost_bps in sorted(set(req.transaction_costs_bps)):
+            previous_position = np.concatenate(([0.0], positions[:-1]))
+            turnover = np.abs(positions - previous_position)
+            cost_rate = cost_bps / 10_000.0
+            gross_returns = positions * realized
+            net_returns = (1.0 + gross_returns) * (1.0 - cost_rate * turnover) - 1.0
+            if np.any(1.0 + net_returns <= 0):
+                raise RuntimeError("A session return reached -100% or below")
+
+            wealth = req.initial_capital * np.cumprod(1.0 + net_returns)
+            daily_returns = np.prod(1.0 + net_returns.reshape(-1, 2), axis=1) - 1.0
+            daily_std = float(np.std(daily_returns, ddof=1)) if len(daily_returns) > 1 else 0.0
+            sharpe = (
+                float(np.mean(daily_returns) / daily_std * math.sqrt(365.0))
+                if daily_std > 0
+                else 0.0
+            )
+
+            scenarios[str(cost_bps)] = {
+                "transaction_cost_bps": cost_bps,
+                "final_value": float(wealth[-1]),
+                "total_return_pct": float((wealth[-1] / req.initial_capital - 1.0) * 100.0),
+                "max_drawdown_pct": float(_max_drawdown(net_returns) * 100.0),
+                "sharpe_zero_rf": sharpe,
+                "position_changes": int(np.count_nonzero(turnover)),
+                "total_turnover": float(turnover.sum()),
+            }
+
+        buy_hold_return = float(np.prod(1.0 + realized) - 1.0)
+        buy_hold_final = float(req.initial_capital * (1.0 + buy_hold_return))
+
+        rows = []
+        for trading_date, row in evaluated.iterrows():
+            rows.append(
+                {
+                    "trading_date": str(pd.Timestamp(trading_date).date()),
+                    "previous_day_return_pct": float(row["previous_day_ret"] * 100.0),
+                    "night_position": "LONG",
+                    "night_return_pct": float(row["night_ret"] * 100.0),
+                    "day_position": (
+                        "SHORT" if row["day_position"] < 0
+                        else "LONG" if row["day_position"] > 0
+                        else "CASH"
+                    ),
+                    "day_return_pct": float(row["day_ret"] * 100.0),
+                }
+            )
+
+        requested_dates = int((end_date - start_date) / pd.Timedelta(days=1))
+        return {
+            "status": "ok",
+            "engine": "study-like vector backtest",
+            "data_source": "Trading Strategy",
+            "market": {
+                "chain": "ethereum",
+                "exchange": pair.exchange_slug,
+                "pair_id": int(pair.pair_id),
+                "base": pair.base_token_symbol,
+                "quote": pair.quote_token_symbol,
+                "fee_tier": float(pair.fee_tier),
+                "time_bucket": "1h",
+            },
+            "strategy": {
+                "name": "Long/Reversal (study-like)",
+                "timezone": "UTC",
+                "day_session": "05:00-17:00",
+                "night_session": "17:00-05:00",
+                "night_rule": "always LONG",
+                "day_rule": "opposite sign of previous daytime session return",
+                "positions": {"long": 1, "cash": 0, "short": -1},
+                "no_lookahead": True,
+            },
+            "request": req.model_dump(),
+            "coverage": {
+                "fetch_start": str(pd.Timestamp(fetch_start)),
+                "fetch_end": str(pd.Timestamp(fetch_end)),
+                "requested_trading_dates": requested_dates,
+                "complete_trading_dates": int(len(evaluated)),
+                "dropped_or_incomplete_dates": int(max(requested_dates - len(evaluated), 0)),
+                "first_session_bar": str(evaluated["night_first_bar"].min()),
+                "last_session_bar": str(evaluated["day_last_bar"].max()),
+            },
+            "benchmark": {
+                "name": "continuous long over the same session returns",
+                "final_value": buy_hold_final,
+                "total_return_pct": buy_hold_return * 100.0,
+            },
+            "cost_scenarios": scenarios,
+            "daily_sessions": rows,
+            "adaptation_notes": {
+                "matches_study_core": [
+                    "1h data",
+                    "UTC 12h/12h sessions",
+                    "17:00-05:00 always long",
+                    "05:00-17:00 reversal from previous same daytime session",
+                    "positions +1/0/-1",
+                    "0/1/2 bps turnover-cost scenarios",
+                    "no lookahead",
+                ],
+                "our_market": "WETH/USDC Uniswap V3 on Ethereum instead of ETH/USD Kraken",
+                "simplified_short": "mathematical -1 exposure; no borrow, funding, margin or liquidation",
+                "not_included": [
+                    "slippage",
+                    "bid-ask spread",
+                    "gas",
+                    "market impact",
+                    "short financing/funding",
+                ],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Long/Reversal backtest failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@api.get("/selftest/long-reversal")
+def long_reversal_selftest():
+    """Validate the study-like strategy on August 2026 WETH/USDC."""
+    result = long_reversal_backtest(LongReversalBacktestRequest())
+    if result["coverage"]["complete_trading_dates"] < 28:
+        raise HTTPException(status_code=500, detail="Long/Reversal self-test has insufficient August coverage")
+    return result
 
 
 @api.get("/selftest/demeter")
