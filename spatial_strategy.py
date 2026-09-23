@@ -176,8 +176,8 @@ def _energy_width(m: np.ndarray, c: np.ndarray) -> tuple[float, float, float]:
     e = np.einsum("gi,ij,gj->g", psi, q, psi)
     e = np.clip(e, 0.0, None)
 
-    int_e = float(np.trapz(e, zz))
-    int_e2 = float(np.trapz(e * e, zz))
+    int_e = float(np.trapezoid(e, zz))
+    int_e2 = float(np.trapezoid(e * e, zz))
     energy = 0.5 * (float(m @ m) + float(np.trace(c)))
     if int_e <= 1e-12 or int_e2 <= 1e-12:
         return energy, 2.0, 0.0
