@@ -222,20 +222,24 @@ def _build_spatial_fields(q: pd.DataFrame, n_bins: int = 7) -> pd.DataFrame:
     depth_norm = (liq / liq_scale).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.10, 10.0)
     q["impact"] = (signed_norm / depth_norm).clip(-20, 20)
 
-    hour_open = q.groupby("hour")["open_tick"].first()
-    hour_high = q.groupby("hour")["high_tick"].max()
-    hour_low = q.groupby("hour")["low_tick"].min()
-    hour_range = (hour_high - hour_low).abs().replace(0, np.nan)
-    range_scale = hour_range.rolling(24, min_periods=8).median().shift(1)
-    fallback = float(hour_range.dropna().median()) if hour_range.notna().any() else 10.0
-    range_scale = range_scale.fillna(fallback).clip(lower=1.0)
+    # Fixed log-price coordinate xi = log(P/P_ref). In Uniswap V3 one tick
+    # corresponds to log(1.0001) in the raw price ratio. P_ref is fixed at the
+    # first warm-up observation, which is known before the target period.
+    valid_ticks = q["close_tick"].dropna()
+    if valid_ticks.empty:
+        raise RuntimeError("No valid close_tick for V8 spatial coordinate")
+    tick_ref = float(valid_ticks.iloc[0])
+    log_tick = math.log(1.0001)
+    q["xi"] = (q["close_tick"] - tick_ref) * log_tick
 
-    q = q.join(hour_open.rename("hour_open_tick"), on="hour")
-    q = q.join(range_scale.rename("tick_scale"), on="hour")
-    q["xi"] = ((q["close_tick"] - q["hour_open_tick"]) / q["tick_scale"]).clip(-3.499, 3.499)
-
-    # Localized indicator basis on a co-moving tick coordinate.
-    q["spatial_bin"] = np.floor((q["xi"] + 3.5) / (7.0 / n_bins)).astype(int)
+    # Fixed support wide enough for roughly exp(+/-1.5) price changes relative
+    # to P_ref. Observations outside the support are accumulated in the tails,
+    # rather than moving the coordinate system with the market.
+    xi_limit = 1.5
+    xi_clipped = q["xi"].clip(-xi_limit + 1e-9, xi_limit - 1e-9)
+    q["spatial_bin"] = np.floor(
+        (xi_clipped + xi_limit) / ((2.0 * xi_limit) / n_bins)
+    ).astype(int)
     q["spatial_bin"] = q["spatial_bin"].clip(0, n_bins - 1)
 
     pivot = q.pivot_table(
@@ -616,7 +620,7 @@ def run_v8_spatial(
         },
         "spatial_field": {
             "bins": int(n_bins),
-            "coordinate": "co-moving realised tick coordinate scaled by past 24h tick range",
+            "coordinate": "fixed xi=log(P/P_ref) tick coordinate; P_ref fixed at first warm-up observation",
             "signed_quote_flow_source": quote_flow_source,
             "depth_proxy": "active liquidity normalized by past minute liquidity",
             "basis": "localized tick field projected to an orthonormal multiscale DCT basis; 3h causal EWM state filter",
