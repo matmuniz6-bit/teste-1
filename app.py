@@ -701,6 +701,20 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             frame["instability_v4"] > frame["instability_v4_threshold"]
         )
 
+        # V4-confirmed state: preserve the stronger V2 detector and use the
+        # OpenAI-inspired spatial terms only as confirmation.
+        # "Pre-critical" means V2 instability is high, localisation/cancellation
+        # are above their causal baselines, while the energy proxy has not yet
+        # become an extreme (> 2 causal standard deviations).
+        frame["spatial_confirmation_v4"] = (
+            frame["z_localisation_v4"] + frame["z_cancellation_v4"]
+        ) / 2.0
+        frame["high_instability_v4_confirmed"] = (
+            frame["high_instability_v2"]
+            & (frame["spatial_confirmation_v4"] > 0.0)
+            & (frame["z_energy_v4"] < 2.0)
+        )
+
         # Same damped integration spirit as the paper, but fully causal.
         frame["u_predicted_next"] = (
             frame["u"] + req.integration_gain * frame["net_force"]
@@ -780,6 +794,26 @@ def ns_criticality_day(req: NavierStokesDayRequest):
 
         frame["v4_event_momentum_3h_position"] = event_pos_v4
         frame["v4_event_momentum_3h_trigger"] = event_trigger_v4
+
+        confirmed = frame["high_instability_v4_confirmed"].fillna(False)
+        rising_edge_confirmed = confirmed & (~confirmed.shift(1).fillna(False))
+        event_pos_confirmed = np.zeros(len(frame), dtype=float)
+        event_trigger_confirmed = np.zeros(len(frame), dtype=bool)
+        for i in range(len(frame) - 1):
+            if not bool(rising_edge_confirmed.iloc[i]):
+                continue
+            direction = float(np.sign(frame["log_ret"].iloc[i]))
+            if direction == 0.0:
+                continue
+            start_i = i + 1
+            end_i = min(i + 4, len(frame))
+            if np.any(event_pos_confirmed[start_i:end_i] != 0):
+                continue
+            event_pos_confirmed[start_i:end_i] = direction
+            event_trigger_confirmed[i] = True
+
+        frame["v4_confirmed_momentum_3h_position"] = event_pos_confirmed
+        frame["v4_confirmed_momentum_3h_trigger"] = event_trigger_confirmed
         frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
 
         previous_position = frame["position"].shift(1).fillna(0.0)
@@ -806,6 +840,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         _apply_probe("stress_ns_position", "stress_ns")
         _apply_probe("event_momentum_3h_position", "event_momentum_3h")
         _apply_probe("v4_event_momentum_3h_position", "v4_event_momentum_3h")
+        _apply_probe("v4_confirmed_momentum_3h_position", "v4_confirmed_momentum_3h")
 
         day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
         needed = [
@@ -982,6 +1017,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             v2_curve = (1.0 + g["stress_momentum_net_ret"]).cumprod()
             v3_curve = (1.0 + g["event_momentum_3h_net_ret"]).cumprod()
             v4_curve = (1.0 + g["v4_event_momentum_3h_net_ret"]).cumprod()
+            v4c_curve = (1.0 + g["v4_confirmed_momentum_3h_net_ret"]).cumprod()
             monthly_rows.append({
                 "month": str(month),
                 "hours": int(len(g)),
@@ -995,10 +1031,15 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "v4_event_momentum_3h_net_return_pct": (
                     float((v4_curve.iloc[-1] - 1.0) * 100.0) if len(v4_curve) else 0.0
                 ),
+                "v4_confirmed_momentum_3h_net_return_pct": (
+                    float((v4c_curve.iloc[-1] - 1.0) * 100.0) if len(v4c_curve) else 0.0
+                ),
                 "v3_turnover": float(g["event_momentum_3h_turnover"].sum()),
                 "v3_event_triggers": int(g["event_momentum_3h_trigger"].sum()),
                 "v4_turnover": float(g["v4_event_momentum_3h_turnover"].sum()),
                 "v4_event_triggers": int(g["v4_event_momentum_3h_trigger"].sum()),
+                "v4_confirmed_turnover": float(g["v4_confirmed_momentum_3h_turnover"].sum()),
+                "v4_confirmed_event_triggers": int(g["v4_confirmed_momentum_3h_trigger"].sum()),
             })
 
         top = (
@@ -1196,6 +1237,15 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
                 **_probe_result("v4_event_momentum_3h"),
                 "event_triggers": int(day["v4_event_momentum_3h_trigger"].sum()),
+            },
+            "v4_confirmed_momentum_3h": {
+                "logic": (
+                    "V2 high-instability plus positive spatial localisation/cancellation confirmation "
+                    "and non-extreme energy proxy; rising edge uses completed-hour momentum for next 3h"
+                ),
+                "cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
+                **_probe_result("v4_confirmed_momentum_3h"),
+                "event_triggers": int(day["v4_confirmed_momentum_3h_trigger"].sum()),
             },
             "highest_criticality_hours": top_events,
             "daily": daily_rows,
