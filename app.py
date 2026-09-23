@@ -164,7 +164,7 @@ def capabilities():
         "defi_simulation": {
             "demeter_adapter_importable": _engine_status()["demeter"]["importable"],
             "uniswap_v3": "clmm_adapter",
-            "aave_v3": "adapter_next",
+            "aave_v3": "lending_smoke_test",
         },
     }
 
@@ -431,6 +431,251 @@ def demeter_selftest():
         raise HTTPException(
             status_code=500,
             detail=f"Demeter CLMM self-test failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
+@api.get("/selftest/aave")
+def aave_selftest():
+    """Run a short Aave V3 Demeter simulation using Trading Strategy lending rates."""
+    try:
+        from decimal import Decimal
+        from pathlib import Path as _Path
+
+        from demeter import Actuator, AtTimeTrigger, MarketInfo, MarketTypeEnum, Strategy, TokenInfo
+        from demeter.aave import AaveV3Market
+        from tradingstrategy.chain import ChainId
+        from tradingstrategy.lending import LendingCandleType, LendingProtocolType
+        from tradingstrategy.timebucket import TimeBucket
+
+        client = _get_ts_client()
+        start = pd.Timestamp("2024-01-01 00:00:00")
+        end = pd.Timestamp("2024-01-02 00:00:00")
+
+        reserve_universe = client.fetch_lending_reserve_universe()
+        weth_desc = (ChainId.ethereum, LendingProtocolType.aave_v3, "WETH")
+        usdc_desc = (ChainId.ethereum, LendingProtocolType.aave_v3, "USDC")
+        limited = reserve_universe.limit([weth_desc, usdc_desc])
+        weth_reserve = limited.resolve_lending_reserve(weth_desc)
+        usdc_reserve = limited.resolve_lending_reserve(usdc_desc)
+
+        rate_map = client.fetch_lending_candles_for_universe(
+            limited,
+            TimeBucket.h1,
+            start_time=start,
+            end_time=end,
+        )
+
+        def _rate_frame(candle_type, reserve_id):
+            df = rate_map[candle_type].copy()
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df = df.set_index("timestamp", drop=False)
+            df = df[df["reserve_id"] == reserve_id].sort_index()
+            if len(df) == 0:
+                raise RuntimeError(f"No {candle_type.value} data for reserve {reserve_id}")
+            return df
+
+        grid = pd.date_range(start=start, end=end, freq="1h")
+
+        def _build_demeter_token_data(reserve):
+            supply = _rate_frame(LendingCandleType.supply_apr, reserve.reserve_id)
+            borrow = _rate_frame(LendingCandleType.variable_borrow_apr, reserve.reserve_id)
+
+            supply_close = supply["close"].astype(float).reindex(grid).ffill().bfill()
+            borrow_close = borrow["close"].astype(float).reindex(grid).ffill().bfill()
+
+            # Trading Strategy stores APR as percent units; Demeter expects decimal annual rates.
+            liquidity_rate = supply_close / 100.0
+            variable_rate = borrow_close / 100.0
+
+            seconds_per_step = 3600.0
+            seconds_per_year = 31_536_000.0
+
+            liquidity_index = []
+            variable_borrow_index = []
+            li = 1.0
+            bi = 1.0
+            for s_rate, b_rate in zip(liquidity_rate, variable_rate):
+                liquidity_index.append(li)
+                variable_borrow_index.append(bi)
+                li *= 1.0 + float(s_rate) * seconds_per_step / seconds_per_year
+                bi *= 1.0 + float(b_rate) * seconds_per_step / seconds_per_year
+
+            return pd.DataFrame(
+                {
+                    "liquidity_rate": liquidity_rate.values,
+                    "stable_borrow_rate": [0.0] * len(grid),
+                    "variable_borrow_rate": variable_rate.values,
+                    "liquidity_index": liquidity_index,
+                    "variable_borrow_index": variable_borrow_index,
+                },
+                index=grid,
+            )
+
+        weth = TokenInfo(
+            name="WETH",
+            decimal=int(weth_reserve.asset_decimals),
+            address=weth_reserve.asset_address,
+        )
+        usdc = TokenInfo(
+            name="USDC",
+            decimal=int(usdc_reserve.asset_decimals),
+            address=usdc_reserve.asset_address,
+        )
+
+        risk_path = _Path("/tmp/aave-risk-ethereum-selftest.csv")
+        risk_rows = []
+        for token, reserve, fallback_ltv, fallback_lt in (
+            ("WETH", weth_reserve, 0.80, 0.825),
+            ("USDC", usdc_reserve, 0.75, 0.78),
+        ):
+            details = reserve.additional_details
+            ltv = float(details.ltv) if details and details.ltv is not None else fallback_ltv
+            liq_threshold = (
+                float(details.liquidation_threshold)
+                if details and details.liquidation_threshold is not None
+                else fallback_lt
+            )
+            risk_rows.append(
+                {
+                    "symbol": token,
+                    "canCollateral": True,
+                    "LTV": f"{ltv * 100:.8f}%",
+                    "liqThereshold": f"{liq_threshold * 100:.8f}%",
+                    "liqBonus": "5%",
+                    "reserveFactor": 0.1,
+                    "canBorrow": True,
+                    "optimalUtilization": 0.8,
+                    "canBorrowStable": False,
+                    "debtCeiling": 0,
+                    "supplyCap": 0,
+                    "borrowCap": 0,
+                    "eModeLtv": 0,
+                    "eModeLiquidationThereshold": 0,
+                    "eModeLiquidationBonus": 0,
+                    "borrowableInIsolation": False,
+                }
+            )
+        pd.DataFrame(risk_rows).to_csv(risk_path, sep=";", index=False)
+
+        market_key = MarketInfo("aave", MarketTypeEnum.aave_v3)
+        market = AaveV3Market(
+            market_info=market_key,
+            risk_parameters_path=str(risk_path),
+            tokens=[weth, usdc],
+        )
+        market.set_token_data(weth, _build_demeter_token_data(weth_reserve))
+        market.set_token_data(usdc, _build_demeter_token_data(usdc_reserve))
+
+        pair = resolve_pair_lightweight(
+            client,
+            chain_id=ChainId.ethereum,
+            exchange_slug="uniswap-v3",
+            base_token="WETH",
+            quote_token="USDC",
+            fee_tier=0.0005,
+        )
+        price_raw = client.fetch_candles_by_pair_ids(
+            [pair.pair_id],
+            TimeBucket.h1,
+            start_time=start,
+            end_time=end,
+            progress_bar_description="Aave self-test WETH price",
+        )
+        price_raw = price_raw.copy()
+        if "timestamp" in price_raw.columns:
+            price_raw["timestamp"] = pd.to_datetime(price_raw["timestamp"])
+            price_raw = price_raw.set_index("timestamp")
+        weth_price = price_raw["close"].astype(float).reindex(grid).ffill().bfill()
+        price_df = pd.DataFrame({"WETH": weth_price, "USDC": 1.0}, index=grid)
+
+        supply_at = grid[1].to_pydatetime()
+        borrow_at = grid[2].to_pydatetime()
+        repay_at = grid[-2].to_pydatetime()
+        withdraw_at = grid[-1].to_pydatetime()
+
+        class _AaveSmokeStrategy(Strategy):
+            def initialize(self):
+                self.triggers.extend(
+                    [
+                        AtTimeTrigger(time=supply_at, do=self._supply),
+                        AtTimeTrigger(time=borrow_at, do=self._borrow),
+                        AtTimeTrigger(time=repay_at, do=self._repay),
+                        AtTimeTrigger(time=withdraw_at, do=self._withdraw),
+                    ]
+                )
+
+            def _supply(self, row_data):
+                market.supply(weth, 1.0, True)
+
+            def _borrow(self, row_data):
+                market.borrow(usdc, 500.0)
+
+            def _repay(self, row_data):
+                for key in list(market.borrow_keys):
+                    market.repay(key)
+
+            def _withdraw(self, row_data):
+                for key in list(market.supply_keys):
+                    market.withdraw(key)
+
+        actuator = Actuator()
+        actuator.broker.add_market(market)
+        actuator.broker.set_balance(weth, Decimal("2"))
+        actuator.broker.set_balance(usdc, Decimal("10"))
+        actuator.strategy = _AaveSmokeStrategy()
+        actuator.set_price(price_df)
+        actuator.interval = "1h"
+        actuator.run(print_result=False)
+
+        action_types = [type(action).__name__ for action in actuator.actions]
+        required_actions = {"SupplyAction", "BorrowAction", "RepayAction", "WithdrawAction"}
+        if not required_actions.issubset(set(action_types)):
+            raise RuntimeError(f"Missing Aave actions: expected {required_actions}, got {action_types}")
+
+        return {
+            "status": "ok",
+            "engine": "Demeter AaveV3Market",
+            "protocol": "Aave V3",
+            "chain": "ethereum",
+            "period": {"start": str(start), "end": str(end), "bucket": "1h"},
+            "reserves": {
+                "WETH": {
+                    "reserve_id": int(weth_reserve.reserve_id),
+                    "ltv": float(weth_reserve.additional_details.ltv),
+                    "liquidation_threshold": float(weth_reserve.additional_details.liquidation_threshold),
+                },
+                "USDC": {
+                    "reserve_id": int(usdc_reserve.reserve_id),
+                    "ltv": float(usdc_reserve.additional_details.ltv),
+                    "liquidation_threshold": float(usdc_reserve.additional_details.liquidation_threshold),
+                },
+            },
+            "actions": action_types,
+            "action_count": len(action_types),
+            "data_lineage": {
+                "observed_historical": [
+                    "Trading Strategy Aave V3 supply APR",
+                    "Trading Strategy Aave V3 variable borrow APR",
+                    "Trading Strategy WETH/USDC OHLCV price",
+                ],
+                "derived": [
+                    "liquidity_index from observed supply APR",
+                    "variable_borrow_index from observed variable borrow APR",
+                ],
+                "parameterized_or_snapshot": [
+                    "stable_borrow_rate fixed to 0 because smoke uses variable debt only",
+                    "non-LTV risk columns required by Demeter use smoke-test parameters",
+                    "LTV/liquidation threshold use Trading Strategy reserve metadata snapshot frozen for this test",
+                ],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Aave V3 self-test failed: {type(exc).__name__}: {exc}",
         ) from exc
 
 
