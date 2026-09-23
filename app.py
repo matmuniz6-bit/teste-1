@@ -730,6 +730,23 @@ def long_reversal_selftest():
     return result
 
 
+@api.get("/selftest/long-reversal-july")
+def long_reversal_july_selftest():
+    """Validate the study-like strategy on July 2026 WETH/USDC."""
+    result = long_reversal_backtest(
+        LongReversalBacktestRequest(
+            start="2026-07-01T00:00:00Z",
+            end="2026-08-01T00:00:00Z",
+        )
+    )
+    if result["coverage"]["complete_trading_dates"] != 31:
+        raise HTTPException(
+            status_code=500,
+            detail="Long/Reversal July self-test does not have all 31 trading dates",
+        )
+    return result
+
+
 @api.get("/selftest/demeter")
 def demeter_selftest():
     """Load real Trading Strategy CLMM data through the official Demeter adapter."""
