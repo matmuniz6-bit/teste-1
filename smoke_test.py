@@ -124,6 +124,7 @@ def main():
         "date": ns_day["date"],
         "market": ns_day["market"],
         "result": ns_day["result"],
+        "next_hour_stress_test": ns_day["next_hour_stress_test"],
         "highest_criticality_hours": ns_day["highest_criticality_hours"],
     })
 
