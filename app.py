@@ -154,7 +154,7 @@ class NavierStokesDayRequest(BaseModel):
     """Causal Navier-Stokes-inspired market microstructure experiment."""
 
     date: str = "2026-08-15"
-    days: int = Field(default=1, ge=1, le=31)
+    days: int = Field(default=1, ge=1, le=366)
     integration_gain: float = Field(default=0.10, gt=0, le=1)
     illustrative_cost_bps_per_turnover: float = Field(default=5.0, ge=0, le=100)
 
@@ -432,17 +432,26 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         if h.empty:
             raise RuntimeError("No usable hourly OHLCV data")
 
-        clmm = client.fetch_clmm_liquidity_provision_candles_by_pair_ids(
-            [pair.pair_id],
-            TimeBucket.m1,
-            start_time=fetch_start.to_pydatetime(),
-            end_time=fetch_end.to_pydatetime(),
-            progress_bar_description=f"N-S {req.days}-day CLMM",
-        )
-        if clmm is None or len(clmm) == 0:
-            raise RuntimeError("No CLMM liquidity data")
+        # Minute CLMM history is fetched in bounded chunks so a 12-month
+        # experiment does not depend on one very large API response.
+        clmm_parts = []
+        chunk_start = fetch_start
+        while chunk_start < fetch_end:
+            chunk_end = min(chunk_start + pd.Timedelta(days=31), fetch_end)
+            part = client.fetch_clmm_liquidity_provision_candles_by_pair_ids(
+                [pair.pair_id],
+                TimeBucket.m1,
+                start_time=chunk_start.to_pydatetime(),
+                end_time=chunk_end.to_pydatetime(),
+                progress_bar_description=f"N-S CLMM {chunk_start.date()}",
+            )
+            if part is not None and len(part):
+                clmm_parts.append(part)
+            chunk_start = chunk_end
 
-        q = clmm.copy()
+        if not clmm_parts:
+            raise RuntimeError("No CLMM liquidity data")
+        q = pd.concat(clmm_parts, ignore_index=True)
         ts_col = "bucket" if "bucket" in q.columns else "timestamp"
         if ts_col not in q.columns:
             raise RuntimeError("CLMM data has no bucket/timestamp column")
@@ -644,6 +653,30 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         frame["stress_momentum_position"] = frame["stress_momentum_signal"].shift(1).fillna(0.0)
         frame["stress_reversal_position"] = frame["stress_reversal_signal"].shift(1).fillna(0.0)
         frame["stress_ns_position"] = frame["stress_ns_signal"].shift(1).fillna(0.0)
+
+        # V3: use the detector as an event trigger instead of trading every
+        # stressed hour. A new high-instability regime takes the just-completed
+        # hour's momentum direction and holds it for the NEXT 3 hours.
+        # This horizon was chosen before the 12-month test because both July
+        # and August V2 showed persistence in the 3h magnitude signal.
+        rising_edge = high & (~high.shift(1).fillna(False))
+        event_pos = np.zeros(len(frame), dtype=float)
+        event_trigger = np.zeros(len(frame), dtype=bool)
+        for i in range(len(frame) - 1):
+            if not bool(rising_edge.iloc[i]):
+                continue
+            direction = float(np.sign(frame["log_ret"].iloc[i]))
+            if direction == 0.0:
+                continue
+            start_i = i + 1
+            end_i = min(i + 4, len(frame))
+            if np.any(event_pos[start_i:end_i] != 0):
+                continue
+            event_pos[start_i:end_i] = direction
+            event_trigger[i] = True
+
+        frame["event_momentum_3h_position"] = event_pos
+        frame["event_momentum_3h_trigger"] = event_trigger
         frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
 
         previous_position = frame["position"].shift(1).fillna(0.0)
@@ -668,6 +701,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         _apply_probe("stress_momentum_position", "stress_momentum")
         _apply_probe("stress_reversal_position", "stress_reversal")
         _apply_probe("stress_ns_position", "stress_ns")
+        _apply_probe("event_momentum_3h_position", "event_momentum_3h")
 
         day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
         needed = [
@@ -766,12 +800,21 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         def _probe_result(prefix: str):
             g = day.dropna(subset=[f"{prefix}_net_ret", f"{prefix}_gross_ret"])
             gross = float(np.exp(g[f"{prefix}_gross_ret"].sum()) - 1.0)
-            net = float(np.prod(1.0 + g[f"{prefix}_net_ret"]) - 1.0)
+            net_curve = (1.0 + g[f"{prefix}_net_ret"]).cumprod()
+            net = float(net_curve.iloc[-1] - 1.0) if len(net_curve) else 0.0
+            peak = net_curve.cummax()
+            drawdown = net_curve / peak - 1.0
+            position_col = f"{prefix}_position"
             return {
                 "gross_return_pct": gross * 100.0,
                 "net_return_pct": net * 100.0,
+                "max_drawdown_pct": float(drawdown.min() * 100.0) if len(drawdown) else 0.0,
                 "total_turnover": float(g[f"{prefix}_turnover"].sum()),
-                "active_hours": int((day[prefix + "_turnover"] > 0).sum()),
+                "active_position_hours": (
+                    int((day[position_col] != 0).sum())
+                    if position_col in day.columns else None
+                ),
+                "turnover_hours": int((day[f"{prefix}_turnover"] > 0).sum()),
             }
 
         daily_rows = []
@@ -797,6 +840,25 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             })
 
         profitable_days = int(sum(1 for row in daily_rows if row["net_strategy_return_pct"] > 0))
+
+        monthly_rows = []
+        for month, g in day.groupby(day.index.to_period("M")):
+            v2_curve = (1.0 + g["stress_momentum_net_ret"]).cumprod()
+            v3_curve = (1.0 + g["event_momentum_3h_net_ret"]).cumprod()
+            monthly_rows.append({
+                "month": str(month),
+                "hours": int(len(g)),
+                "buy_hold_return_pct": float((np.exp(g["log_ret"].sum()) - 1.0) * 100.0),
+                "v2_stress_momentum_net_return_pct": (
+                    float((v2_curve.iloc[-1] - 1.0) * 100.0) if len(v2_curve) else 0.0
+                ),
+                "v3_event_momentum_3h_net_return_pct": (
+                    float((v3_curve.iloc[-1] - 1.0) * 100.0) if len(v3_curve) else 0.0
+                ),
+                "v3_turnover": float(g["event_momentum_3h_turnover"].sum()),
+                "v3_event_triggers": int(g["event_momentum_3h_trigger"].sum()),
+            })
+
         top = (
             day.sort_values("criticality", ascending=False)
             .head(10)
@@ -935,8 +997,18 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "reversal": _probe_result("stress_reversal"),
                 "ns_direction": _probe_result("stress_ns"),
             },
+            "v3_event_momentum_3h": {
+                "logic": (
+                    "rising-edge high-instability event; completed-hour momentum "
+                    "sets direction for the next 3 hours; overlapping events ignored"
+                ),
+                "cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
+                **_probe_result("event_momentum_3h"),
+                "event_triggers": int(day["event_momentum_3h_trigger"].sum()),
+            },
             "highest_criticality_hours": top_events,
             "daily": daily_rows,
+            "monthly": monthly_rows,
             "hourly": hourly,
             "limitations": [
                 "This is an exploratory financial analogy, not a physical Navier-Stokes solution.",
@@ -971,6 +1043,13 @@ def ns_criticality_august_selftest():
 def ns_instability_july_selftest():
     return ns_criticality_day(
         NavierStokesDayRequest(date="2026-07-01", days=31)
+    )
+
+
+@api.get("/selftest/ns-instability-12m")
+def ns_instability_12m_selftest():
+    return ns_criticality_day(
+        NavierStokesDayRequest(date="2025-09-01", days=365)
     )
 
 
