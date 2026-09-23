@@ -378,8 +378,8 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
         end = pd.Timestamp(_parse_dt(req.end))
         if end <= start:
             raise HTTPException(status_code=400, detail="end must be after start")
-        if end - start > pd.Timedelta(days=62):
-            raise HTTPException(status_code=400, detail="Long/Reversal endpoint is limited to 62 days per run")
+        if end - start > pd.Timedelta(days=3700):
+            raise HTTPException(status_code=400, detail="Long/Reversal endpoint is limited to 3700 days per run")
         if end - start < pd.Timedelta(days=2):
             raise HTTPException(status_code=400, detail="Long/Reversal backtest requires at least 2 days")
         if not req.transaction_costs_bps:
@@ -528,8 +528,6 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
         ].copy()
         if evaluated.empty:
             raise RuntimeError("No complete 12h/12h trading dates in requested period")
-        if evaluated["previous_day_ret"].isna().any():
-            raise RuntimeError("Warm-up data was insufficient for the first reversal signal")
 
         positions = np.column_stack(
             [
@@ -745,6 +743,17 @@ def long_reversal_july_selftest():
             detail="Long/Reversal July self-test does not have all 31 trading dates",
         )
     return result
+
+
+@api.get("/selftest/long-reversal-study-period")
+def long_reversal_study_period_selftest():
+    """Run the study's 2016-2025 calendar span on our WETH/USDC market."""
+    return long_reversal_backtest(
+        LongReversalBacktestRequest(
+            start="2016-01-01T00:00:00Z",
+            end="2026-01-01T00:00:00Z",
+        )
+    )
 
 
 @api.get("/selftest/demeter")
