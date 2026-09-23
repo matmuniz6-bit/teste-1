@@ -16,6 +16,7 @@ from app import (
     long_reversal_study_period_selftest,
     ns_criticality_aug15_selftest,
     ns_criticality_august_selftest,
+    ns_instability_july_selftest,
     native_backtest,
     trading_strategy_selftest,
 )
@@ -134,11 +135,25 @@ def main():
     assert ns_aug["causality"]["lookahead"] is False
     assert ns_aug["result"]["requested_days"] == 31
     assert ns_aug["result"]["complete_hours"] >= 700
+    assert ns_aug["instability_v2"]["evaluated_hours"] >= 700
     print("SMOKE ns_criticality_august: OK", {
         "result": ns_aug["result"],
-        "next_hour_stress_test": ns_aug["next_hour_stress_test"],
-        "highest_criticality_hours": ns_aug["highest_criticality_hours"],
-        "daily": ns_aug["daily"],
+        "v1": ns_aug["next_hour_stress_test"],
+        "v2": ns_aug["instability_v2"],
+        "probes": ns_aug["stress_gated_direction_probes"],
+    })
+
+    ns_july = ns_instability_july_selftest()
+    assert ns_july["status"] == "ok"
+    assert ns_july["causality"]["lookahead"] is False
+    assert ns_july["result"]["requested_days"] == 31
+    assert ns_july["result"]["complete_hours"] >= 700
+    assert ns_july["instability_v2"]["evaluated_hours"] >= 700
+    print("SMOKE ns_instability_july: OK", {
+        "result": ns_july["result"],
+        "v1": ns_july["next_hour_stress_test"],
+        "v2": ns_july["instability_v2"],
+        "probes": ns_july["stress_gated_direction_probes"],
     })
 
     aave = aave_selftest()
