@@ -262,7 +262,7 @@ def native_backtest(req: NativeBacktestRequest):
         # run_backtest_for_module() assumes the trade-executor CLI has already
         # installed its custom Logger.trade()/trade_high() methods.
         if not hasattr(_logging.Logger, "trade"):
-            setup_logging(log_level=_logging.INFO)
+            setup_logging(log_level=_logging.WARNING)
 
         chain_id = _chain_id(req.chain)
         bucket = _time_bucket(req.time_bucket)
