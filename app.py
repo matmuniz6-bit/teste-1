@@ -151,9 +151,10 @@ class LongReversalBacktestRequest(BaseModel):
 
 
 class NavierStokesDayRequest(BaseModel):
-    """One-day causal Navier-Stokes-inspired market microstructure experiment."""
+    """Causal Navier-Stokes-inspired market microstructure experiment."""
 
     date: str = "2026-08-15"
+    days: int = Field(default=1, ge=1, le=31)
     integration_gain: float = Field(default=0.10, gt=0, le=1)
     illustrative_cost_bps_per_turnover: float = Field(default=5.0, ge=0, le=100)
 
@@ -373,7 +374,7 @@ def native_backtest(req: NativeBacktestRequest):
 
 @api.post("/experiment/ns-criticality-day")
 def ns_criticality_day(req: NavierStokesDayRequest):
-    """Causal one-day Navier-Stokes-inspired experiment on WETH/USDC.
+    """Causal Navier-Stokes-inspired experiment on WETH/USDC.
 
     This is an exploratory mapping, not a claim that financial prices obey the
     physical Navier-Stokes PDE. All variables at hour t only determine the
@@ -387,7 +388,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         if target.tzinfo is not None:
             target = target.tz_convert("UTC").tz_localize(None)
         target = target.floor("D")
-        target_end = target + pd.Timedelta(days=1)
+        target_end = target + pd.Timedelta(days=req.days)
         fetch_start = target - pd.Timedelta(hours=72)
         fetch_end = target_end + pd.Timedelta(hours=1)
 
@@ -406,7 +407,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             TimeBucket.h1,
             start_time=fetch_start.to_pydatetime(),
             end_time=fetch_end.to_pydatetime(),
-            progress_bar_description="N-S one-day OHLCV",
+            progress_bar_description=f"N-S {req.days}-day OHLCV",
         )
         if candles is None or len(candles) == 0:
             raise RuntimeError("No hourly OHLCV data")
@@ -436,7 +437,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             TimeBucket.m1,
             start_time=fetch_start.to_pydatetime(),
             end_time=fetch_end.to_pydatetime(),
-            progress_bar_description="N-S one-day CLMM",
+            progress_bar_description=f"N-S {req.days}-day CLMM",
         )
         if clmm is None or len(clmm) == 0:
             raise RuntimeError("No CLMM liquidity data")
@@ -567,8 +568,11 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             "position", "log_ret", "gross_strategy_ret", "net_strategy_ret",
         ]
         day = day.dropna(subset=needed)
-        if len(day) < 20:
-            raise RuntimeError(f"Only {len(day)} complete experimental hours for target day")
+        expected_hours = int(req.days * 24)
+        if len(day) < max(20, int(expected_hours * 0.90)):
+            raise RuntimeError(
+                f"Only {len(day)} complete experimental hours for {expected_hours} expected hours"
+            )
 
         actual_sign = np.sign(day["log_ret"].to_numpy())
         pos = day["position"].to_numpy()
@@ -613,9 +617,32 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 np.mean(predicted_dir == actual_next_dir) * 100.0
             )
 
+        daily_rows = []
+        for trading_date, g in day.groupby(day.index.floor("D")):
+            g_active = g["position"].to_numpy() != 0
+            g_actual_sign = np.sign(g["log_ret"].to_numpy())
+            g_pos = g["position"].to_numpy()
+            g_dir_acc = (
+                float(np.mean(g_pos[g_active] == g_actual_sign[g_active]) * 100.0)
+                if g_active.any()
+                else 0.0
+            )
+            daily_rows.append({
+                "date": str(pd.Timestamp(trading_date).date()),
+                "hours": int(len(g)),
+                "buy_hold_return_pct": float((np.exp(g["log_ret"].sum()) - 1.0) * 100.0),
+                "gross_strategy_return_pct": float((np.exp(g["gross_strategy_ret"].sum()) - 1.0) * 100.0),
+                "net_strategy_return_pct": float((np.prod(1.0 + g["net_strategy_ret"]) - 1.0) * 100.0),
+                "direction_accuracy_pct": g_dir_acc,
+                "turnover": float(g["turnover"].sum()),
+                "mean_criticality": float(g["criticality"].mean()),
+                "max_criticality": float(g["criticality"].max()),
+            })
+
+        profitable_days = int(sum(1 for row in daily_rows if row["net_strategy_return_pct"] > 0))
         top = (
             day.sort_values("criticality", ascending=False)
-            .head(5)
+            .head(10)
             .sort_index()
         )
         top_events = []
@@ -680,7 +707,10 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "cancellation": "(|A|+|P|+|D|)/(|A+P+D|+epsilon)",
             },
             "result": {
+                "requested_days": int(req.days),
+                "expected_hours": expected_hours,
                 "complete_hours": int(len(day)),
+                "coverage_pct": float(len(day) / expected_hours * 100.0),
                 "start_price": float(day["close"].iloc[0]),
                 "end_price": float(day["close"].iloc[-1]),
                 "buy_hold_return_pct": buy_hold * 100.0,
@@ -689,6 +719,8 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "net_strategy_return_pct": net_total * 100.0,
                 "illustrative_cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
                 "total_turnover": float(day["turnover"].sum()),
+                "profitable_days_net": profitable_days,
+                "losing_or_flat_days_net": int(len(daily_rows) - profitable_days),
                 "mean_criticality": float(day["criticality"].mean()),
                 "max_criticality": float(day["criticality"].max()),
                 "max_cancellation_stress": float(day["cancellation_stress"].max()),
@@ -713,6 +745,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "direction_accuracy_next_hour_when_high_stress_pct": high_dir_accuracy,
             },
             "highest_criticality_hours": top_events,
+            "daily": daily_rows,
             "hourly": hourly,
             "limitations": [
                 "This is an exploratory financial analogy, not a physical Navier-Stokes solution.",
@@ -734,6 +767,13 @@ def ns_criticality_day(req: NavierStokesDayRequest):
 @api.get("/selftest/ns-criticality-aug15")
 def ns_criticality_aug15_selftest():
     return ns_criticality_day(NavierStokesDayRequest())
+
+
+@api.get("/selftest/ns-criticality-august")
+def ns_criticality_august_selftest():
+    return ns_criticality_day(
+        NavierStokesDayRequest(date="2026-08-01", days=31)
+    )
 
 
 @api.post("/backtest/long-reversal")
