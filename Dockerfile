@@ -8,7 +8,7 @@ ENV PYTHONPATH="/usr/src/trade-executor:/usr/src/trade-executor/deps/web3-ethere
 
 RUN python -m pip install --no-cache-dir fastapi uvicorn zelos-demeter
 
-COPY app.py native_strategy.py market_data.py smoke_test.py ns_12m_test.py ns_prior_12m_test.py ns_older_12m_test.py ns_older2_12m_test.py ns_oldest_12m_test.py /app/
+COPY app.py native_strategy.py market_data.py smoke_test.py ns_12m_test.py ns_prior_12m_test.py ns_older_12m_test.py ns_older2_12m_test.py ns_oldest_12m_test.py ns_v5_backfill_test.py ns_v5_holdout_test.py /app/
 
 ENTRYPOINT []
 CMD ["sh","-c","cd /usr/src/trade-executor && python -m uvicorn --app-dir /app app:api --host 0.0.0.0 --port ${PORT:-8000}"]
