@@ -814,6 +814,56 @@ def ns_criticality_day(req: NavierStokesDayRequest):
 
         frame["v4_confirmed_momentum_3h_position"] = event_pos_confirmed
         frame["v4_confirmed_momentum_3h_trigger"] = event_trigger_confirmed
+
+        # Predeclared V3 momentum-continuation research gates.
+        # These are locked before inspecting the prior 12-month holdout.
+        abs_ret_median = (
+            frame["log_ret"].abs().rolling(72, min_periods=24).median().shift(1)
+        )
+        momentum_sign = np.sign(frame["log_ret"])
+        ns_agreement = np.sign(frame["u_predicted_next"]) == momentum_sign
+
+        candidate_conditions = {
+            "amp_positive": frame["z_amplification_v2"] > 0.0,
+            "flow_positive": frame["z_flow_pressure_v2"] > 0.0,
+            "liq_deficit_positive": frame["z_liquidity_deficit_v2"] > 0.0,
+            "ns_agrees_momentum": ns_agreement,
+            "momentum_strong": frame["log_ret"].abs() > abs_ret_median,
+            "flow_and_amp_positive": (
+                (frame["z_flow_pressure_v2"] > 0.0)
+                & (frame["z_amplification_v2"] > 0.0)
+            ),
+            "localisation_positive": frame["z_localisation_v4"] > 0.0,
+            "energy_not_extreme": frame["z_energy_v4"] < 2.0,
+            "cancellation_positive": frame["z_cancellation_v4"] > 0.0,
+        }
+
+        def _build_event_momentum(trigger: pd.Series, hold_hours: int = 3):
+            pos = np.zeros(len(frame), dtype=float)
+            trig = np.zeros(len(frame), dtype=bool)
+            trigger = trigger.fillna(False).astype(bool)
+            for i in range(len(frame) - 1):
+                if not bool(trigger.iloc[i]):
+                    continue
+                direction = float(np.sign(frame["log_ret"].iloc[i]))
+                if direction == 0.0:
+                    continue
+                start_i = i + 1
+                end_i = min(i + 1 + hold_hours, len(frame))
+                if np.any(pos[start_i:end_i] != 0):
+                    continue
+                pos[start_i:end_i] = direction
+                trig[i] = True
+            return pos, trig
+
+        candidate_prefixes = []
+        for name, cond in candidate_conditions.items():
+            pos_c, trig_c = _build_event_momentum(rising_edge & cond, hold_hours=3)
+            prefix = f"v3gate_{name}"
+            frame[f"{prefix}_position"] = pos_c
+            frame[f"{prefix}_trigger"] = trig_c
+            candidate_prefixes.append(prefix)
+
         frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
 
         previous_position = frame["position"].shift(1).fillna(0.0)
@@ -829,9 +879,11 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             p = frame[position_col]
             prev = p.shift(1).fillna(0.0)
             turn = (p - prev).abs()
-            gross = p * frame["log_ret"]
-            net = (1.0 + gross) * (1.0 - cost_rate * turn) - 1.0
-            frame[f"{prefix}_gross_ret"] = gross
+            signed_log_ret = p * frame["log_ret"]
+            gross_simple = np.expm1(signed_log_ret)
+            net = np.exp(signed_log_ret) * (1.0 - cost_rate * turn) - 1.0
+            frame[f"{prefix}_signed_log_ret"] = signed_log_ret
+            frame[f"{prefix}_gross_ret"] = gross_simple
             frame[f"{prefix}_net_ret"] = net
             frame[f"{prefix}_turnover"] = turn
 
@@ -841,6 +893,8 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         _apply_probe("event_momentum_3h_position", "event_momentum_3h")
         _apply_probe("v4_event_momentum_3h_position", "v4_event_momentum_3h")
         _apply_probe("v4_confirmed_momentum_3h_position", "v4_confirmed_momentum_3h")
+        for prefix in candidate_prefixes:
+            _apply_probe(f"{prefix}_position", prefix)
 
         day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
         needed = [
@@ -970,7 +1024,8 @@ def ns_criticality_day(req: NavierStokesDayRequest):
 
         def _probe_result(prefix: str):
             g = day.dropna(subset=[f"{prefix}_net_ret", f"{prefix}_gross_ret"])
-            gross = float(np.exp(g[f"{prefix}_gross_ret"].sum()) - 1.0)
+            gross_curve = (1.0 + g[f"{prefix}_gross_ret"]).cumprod()
+            gross = float(gross_curve.iloc[-1] - 1.0) if len(gross_curve) else 0.0
             net_curve = (1.0 + g[f"{prefix}_net_ret"]).cumprod()
             net = float(net_curve.iloc[-1] - 1.0) if len(net_curve) else 0.0
             peak = net_curve.cummax()
@@ -987,6 +1042,23 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 ),
                 "turnover_hours": int((day[f"{prefix}_turnover"] > 0).sum()),
             }
+
+        def _probe_cost_sensitivity(prefix: str):
+            g = day.dropna(subset=[f"{prefix}_signed_log_ret", f"{prefix}_turnover"])
+            signed = g[f"{prefix}_signed_log_ret"]
+            turn = g[f"{prefix}_turnover"]
+            out = {}
+            for bps in (0, 2, 5, 10, 15, 20):
+                cr = bps / 10_000.0
+                step = np.exp(signed) * (1.0 - cr * turn) - 1.0
+                curve = (1.0 + step).cumprod()
+                peak = curve.cummax()
+                dd = curve / peak - 1.0
+                out[str(bps)] = {
+                    "net_return_pct": float((curve.iloc[-1] - 1.0) * 100.0) if len(curve) else 0.0,
+                    "max_drawdown_pct": float(dd.min() * 100.0) if len(dd) else 0.0,
+                }
+            return out
 
         daily_rows = []
         for trading_date, g in day.groupby(day.index.floor("D")):
@@ -1185,9 +1257,19 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                     "rising-edge high-instability event; completed-hour momentum "
                     "sets direction for the next 3 hours; overlapping events ignored"
                 ),
+                "return_accounting": "exact signed log-return compounding before multiplicative turnover costs",
                 "cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
                 **_probe_result("event_momentum_3h"),
+                "cost_sensitivity_bps": _probe_cost_sensitivity("event_momentum_3h"),
                 "event_triggers": int(day["event_momentum_3h_trigger"].sum()),
+            },
+            "v3_momentum_gate_research": {
+                prefix.replace("v3gate_", ""): {
+                    **_probe_result(prefix),
+                    "cost_sensitivity_bps": _probe_cost_sensitivity(prefix),
+                    "event_triggers": int(day[f"{prefix}_trigger"].sum()),
+                }
+                for prefix in candidate_prefixes
             },
             "instability_v4_spatial": {
                 "design": (
