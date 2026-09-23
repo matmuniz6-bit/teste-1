@@ -8,6 +8,7 @@ import sys
 
 from app import (
     NativeBacktestRequest,
+    aave_selftest,
     demeter_selftest,
     health,
     native_backtest,
@@ -61,6 +62,19 @@ def main():
         "request": demeter["request"],
         "clmm_rows": demeter["clmm_rows"],
         "demeter": demeter["demeter"],
+    })
+
+    aave = aave_selftest()
+    assert aave["status"] == "ok"
+    assert aave["engine"] == "Demeter AaveV3Market"
+    assert aave["protocol"] == "Aave V3"
+    required = {"SupplyAction", "BorrowAction", "RepayAction", "WithdrawAction"}
+    assert required.issubset(set(aave["actions"]))
+    print("SMOKE aave_v3: OK", {
+        "period": aave["period"],
+        "reserves": aave["reserves"],
+        "actions": aave["actions"],
+        "data_lineage": aave["data_lineage"],
     })
 
 
