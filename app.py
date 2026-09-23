@@ -424,6 +424,7 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
         else:
             raise RuntimeError("Candle dataset has no usable timestamp")
 
+        x = x.reset_index(drop=True)
         x["close"] = pd.to_numeric(x["close"], errors="coerce")
         x = (
             x[["timestamp", "close"]]
