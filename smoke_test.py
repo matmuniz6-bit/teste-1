@@ -11,6 +11,7 @@ from app import (
     aave_selftest,
     demeter_selftest,
     health,
+    long_reversal_july_selftest,
     long_reversal_selftest,
     native_backtest,
     trading_strategy_selftest,
@@ -86,6 +87,19 @@ def main():
         "data_quality": lr["data_quality"],
         "benchmark": lr["benchmark"],
         "cost_scenarios": lr["cost_scenarios"],
+    })
+
+    july = long_reversal_july_selftest()
+    assert july["status"] == "ok"
+    assert july["coverage"]["complete_trading_dates"] == 31
+    assert july["data_quality"]["hourly_continuity_ok"] is True
+    assert set(july["cost_scenarios"].keys()) == {"0", "1", "2"}
+    assert set(july["benchmark"]["cost_scenarios"].keys()) == {"0", "1", "2"}
+    print("SMOKE long_reversal_july: OK", {
+        "coverage": july["coverage"],
+        "data_quality": july["data_quality"],
+        "benchmark": july["benchmark"],
+        "cost_scenarios": july["cost_scenarios"],
     })
 
     aave = aave_selftest()
