@@ -425,14 +425,49 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
             raise RuntimeError("Candle dataset has no usable timestamp")
 
         x = x.reset_index(drop=True)
+        raw_rows = int(len(x))
+        duplicate_timestamps = int(x["timestamp"].duplicated().sum())
         x["close"] = pd.to_numeric(x["close"], errors="coerce")
-        x = (
-            x[["timestamp", "close"]]
-            .dropna()
-            .sort_values("timestamp")
-            .drop_duplicates("timestamp", keep="last")
-        )
+        x = x[["timestamp", "close"]].dropna().sort_values("timestamp")
+        if duplicate_timestamps:
+            raise RuntimeError(f"Duplicate hourly timestamps in source data: {duplicate_timestamps}")
+        x = x.drop_duplicates("timestamp", keep="last")
         x = x[x["close"] > 0].copy()
+        if x.empty:
+            raise RuntimeError("No valid positive-price candles after cleaning")
+
+        actual_index = pd.DatetimeIndex(x["timestamp"])
+        expected_index = pd.date_range(
+            start=actual_index.min(),
+            end=actual_index.max(),
+            freq="1h",
+        )
+        missing_hours = int(len(expected_index.difference(actual_index)))
+        extra_hours = int(len(actual_index.difference(expected_index)))
+        off_grid_timestamps = int(
+            (
+                (x["timestamp"].dt.minute != 0)
+                | (x["timestamp"].dt.second != 0)
+                | (x["timestamp"].dt.microsecond != 0)
+            ).sum()
+        )
+        if missing_hours or extra_hours or off_grid_timestamps:
+            raise RuntimeError(
+                "Hourly data continuity check failed: "
+                f"missing={missing_hours}, extra={extra_hours}, off_grid={off_grid_timestamps}"
+            )
+        data_quality = {
+            "raw_rows": raw_rows,
+            "rows_after_cleaning": int(len(x)),
+            "duplicate_timestamps": duplicate_timestamps,
+            "missing_hours": missing_hours,
+            "extra_hours": extra_hours,
+            "off_grid_timestamps": off_grid_timestamps,
+            "data_start": str(actual_index.min()),
+            "data_end": str(actual_index.max()),
+            "hourly_continuity_ok": True,
+        }
+
         x["bar_ret"] = x["close"].pct_change()
         x = x.dropna(subset=["bar_ret"]).copy()
 
@@ -539,12 +574,57 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
                 "total_return_pct": float((wealth[-1] / req.initial_capital - 1.0) * 100.0),
                 "max_drawdown_pct": float(_max_drawdown(net_returns) * 100.0),
                 "sharpe_zero_rf": sharpe,
+                "annualized_daily_volatility_pct": float(daily_std * math.sqrt(365.0) * 100.0),
                 "position_changes": int(np.count_nonzero(turnover)),
                 "total_turnover": float(turnover.sum()),
             }
 
-        buy_hold_return = float(np.prod(1.0 + realized) - 1.0)
-        buy_hold_final = float(req.initial_capital * (1.0 + buy_hold_return))
+        # Study-equivalent buy-and-hold is Long/Long over the same two
+        # sessions, with the same turnover-cost formula. It pays only the
+        # initial 0 -> +1 position change and then remains continuously long.
+        benchmark_scenarios = {}
+        benchmark_positions = np.ones_like(realized, dtype=float)
+        benchmark_previous = np.concatenate(([0.0], benchmark_positions[:-1]))
+        benchmark_turnover = np.abs(benchmark_positions - benchmark_previous)
+        for cost_bps in sorted(set(req.transaction_costs_bps)):
+            cost_rate = cost_bps / 10_000.0
+            benchmark_net_returns = (
+                (1.0 + realized) * (1.0 - cost_rate * benchmark_turnover) - 1.0
+            )
+            benchmark_wealth = req.initial_capital * np.cumprod(1.0 + benchmark_net_returns)
+            benchmark_daily = (
+                np.prod(1.0 + benchmark_net_returns.reshape(-1, 2), axis=1) - 1.0
+            )
+            benchmark_daily_std = (
+                float(np.std(benchmark_daily, ddof=1))
+                if len(benchmark_daily) > 1
+                else 0.0
+            )
+            benchmark_sharpe = (
+                float(
+                    np.mean(benchmark_daily)
+                    / benchmark_daily_std
+                    * math.sqrt(365.0)
+                )
+                if benchmark_daily_std > 0
+                else 0.0
+            )
+            benchmark_scenarios[str(cost_bps)] = {
+                "transaction_cost_bps": cost_bps,
+                "final_value": float(benchmark_wealth[-1]),
+                "total_return_pct": float(
+                    (benchmark_wealth[-1] / req.initial_capital - 1.0) * 100.0
+                ),
+                "max_drawdown_pct": float(
+                    _max_drawdown(benchmark_net_returns) * 100.0
+                ),
+                "sharpe_zero_rf": benchmark_sharpe,
+                "annualized_daily_volatility_pct": float(
+                    benchmark_daily_std * math.sqrt(365.0) * 100.0
+                ),
+                "position_changes": int(np.count_nonzero(benchmark_turnover)),
+                "total_turnover": float(benchmark_turnover.sum()),
+            }
 
         rows = []
         for trading_date, row in evaluated.iterrows():
@@ -584,6 +664,10 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
                 "night_session": "17:00-05:00",
                 "night_rule": "always LONG",
                 "day_rule": "opposite sign of previous daytime session return",
+                "first_requested_day_signal": (
+                    "may use the immediately preceding same-session return, "
+                    "matching the study holdout convention"
+                ),
                 "positions": {"long": 1, "cash": 0, "short": -1},
                 "no_lookahead": True,
             },
@@ -597,10 +681,10 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
                 "first_session_bar": str(evaluated["night_first_bar"].min()),
                 "last_session_bar": str(evaluated["day_last_bar"].max()),
             },
+            "data_quality": data_quality,
             "benchmark": {
-                "name": "continuous long over the same session returns",
-                "final_value": buy_hold_final,
-                "total_return_pct": buy_hold_return * 100.0,
+                "name": "Buy-and-hold / Long-Long over the same session returns",
+                "cost_scenarios": benchmark_scenarios,
             },
             "cost_scenarios": scenarios,
             "daily_sessions": rows,
@@ -612,6 +696,9 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
                     "05:00-17:00 reversal from previous same daytime session",
                     "positions +1/0/-1",
                     "0/1/2 bps turnover-cost scenarios",
+                    "buy-and-hold Long/Long benchmark under the same turnover costs",
+                    "explicit hourly continuity validation",
+                    "annualized daily volatility",
                     "no lookahead",
                 ],
                 "our_market": "WETH/USDC Uniswap V3 on Ethereum instead of ETH/USD Kraken",
