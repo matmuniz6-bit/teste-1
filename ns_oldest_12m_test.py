@@ -1,4 +1,4 @@
-"""Earliest untouched 2021-09 to 2022-09 validation for N-S momentum research."""
+"""Single-window N-S momentum research validation."""
 
 import sys
 from app import ns_instability_oldest_12m_selftest
@@ -17,11 +17,11 @@ def main():
         "v2": result["instability_v2"],
         "v3": result["v3_event_momentum_3h"],
         "v5": result["v5_adaptive_direction"],
+        "v6": result["v6_horizon_research"],
         "momentum_gates": result["v3_momentum_gate_research"],
         "v4_detector": result["instability_v4_spatial"],
         "v4_raw": result["v4_event_momentum_3h"],
         "v4_confirmed": result["v4_confirmed_momentum_3h"],
-        "monthly": result["monthly"],
     })
 
 
