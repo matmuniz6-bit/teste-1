@@ -447,7 +447,10 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         if ts_col not in q.columns:
             raise RuntimeError("CLMM data has no bucket/timestamp column")
         q["timestamp"] = pd.to_datetime(q[ts_col], utc=True).dt.tz_convert(None)
-        for col in ("current_liquidity", "high_tick", "low_tick"):
+        for col in (
+            "current_liquidity", "high_tick", "low_tick",
+            "in_amount0", "in_amount1", "net_amount0", "net_amount1",
+        ):
             if col in q.columns:
                 q[col] = pd.to_numeric(q[col], errors="coerce")
         if "current_liquidity" not in q.columns:
@@ -457,6 +460,13 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         if "high_tick" in q.columns and "low_tick" in q.columns:
             q["tick_span"] = (q["high_tick"] - q["low_tick"]).abs()
             agg_map["tick_span"] = "median"
+        for col in ("in_amount0", "in_amount1"):
+            if col in q.columns:
+                agg_map[col] = "sum"
+        for col in ("net_amount0", "net_amount1"):
+            if col in q.columns:
+                q[f"abs_{col}"] = q[col].abs()
+                agg_map[f"abs_{col}"] = "sum"
 
         liq = (
             q.set_index("timestamp")
@@ -541,6 +551,58 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             + frame["z_cancellation"]
         ) / 3.0
 
+        # V2 instability detector:
+        # 1) use actual Uniswap swap-flow intensity rather than price-volume only,
+        # 2) emphasize flow relative to active liquidity,
+        # 3) retain nonlinear amplification vs diffusion,
+        # 4) drop cancellation from the predictive score because August V1 showed
+        #    essentially no next-hour magnitude relationship for that term.
+        def _ratio_to_trailing_median(s: pd.Series, window: int = 72) -> pd.Series:
+            med = s.rolling(window, min_periods=24).median().shift(1)
+            return (s / med.replace(0, np.nan)).clip(0.0, 25.0)
+
+        flow_components = []
+        for col in ("in_amount0", "in_amount1", "abs_net_amount0", "abs_net_amount1"):
+            if col in frame.columns:
+                flow_components.append(_ratio_to_trailing_median(frame[col].abs()))
+        if flow_components:
+            frame["swap_flow_intensity"] = pd.concat(flow_components, axis=1).mean(axis=1)
+        else:
+            # Fallback remains causal if a historical CLMM schema lacks flow columns.
+            frame["swap_flow_intensity"] = frame["volume_ratio"]
+
+        frame["flow_pressure_v2"] = (
+            frame["swap_flow_intensity"] / frame["rho"].clip(lower=0.10)
+        )
+        frame["liquidity_deficit_v2"] = 1.0 / frame["rho"].clip(lower=0.10)
+        frame["amplification_v2"] = frame["amplification_minus_damping"].clip(lower=0.0)
+
+        def causal_z(s: pd.Series, window: int = 72) -> pd.Series:
+            mean = s.rolling(window, min_periods=24).mean().shift(1)
+            std = s.rolling(window, min_periods=24).std().shift(1).replace(0, np.nan)
+            return ((s - mean) / std).clip(-6, 6)
+
+        frame["z_flow_pressure_v2"] = causal_z(np.log1p(frame["flow_pressure_v2"]))
+        frame["z_amplification_v2"] = causal_z(np.log1p(frame["amplification_v2"]))
+        frame["z_liquidity_deficit_v2"] = causal_z(np.log1p(frame["liquidity_deficit_v2"]))
+        frame["instability_v2"] = (
+            frame["z_flow_pressure_v2"]
+            + frame["z_amplification_v2"]
+            + frame["z_liquidity_deficit_v2"]
+        ) / 3.0
+
+        # Adaptive stress threshold: top decile relative to the PREVIOUS 7 days.
+        # shift(1) prevents the current observation from setting its own threshold.
+        frame["instability_v2_threshold"] = (
+            frame["instability_v2"]
+            .rolling(168, min_periods=48)
+            .quantile(0.90)
+            .shift(1)
+        )
+        frame["high_instability_v2"] = (
+            frame["instability_v2"] > frame["instability_v2_threshold"]
+        )
+
         # Same damped integration spirit as the paper, but fully causal.
         frame["u_predicted_next"] = (
             frame["u"] + req.integration_gain * frame["net_force"]
@@ -548,7 +610,32 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         frame["signal_for_next_hour"] = np.sign(frame["u_predicted_next"])
         frame["next_log_ret"] = frame["log_ret"].shift(-1)
         frame["next_abs_log_ret"] = frame["next_log_ret"].abs()
+        frame["next_rv3"] = np.sqrt(
+            sum(frame["log_ret"].shift(-k).pow(2) for k in range(1, 4))
+        )
+        frame["next_rv6"] = np.sqrt(
+            sum(frame["log_ret"].shift(-k).pow(2) for k in range(1, 7))
+        )
+        frame["large_move_cutoff"] = (
+            frame["log_ret"].abs()
+            .rolling(168, min_periods=48)
+            .quantile(0.75)
+        )
+        frame["next_hour_large_move"] = (
+            frame["next_abs_log_ret"] > frame["large_move_cutoff"]
+        )
+
         frame["position"] = frame["signal_for_next_hour"].shift(1).fillna(0.0)
+
+        # Stress-gated directional probes. The detector decides WHEN to trade;
+        # direction is deliberately kept as three simple, predeclared rules.
+        high = frame["high_instability_v2"].fillna(False)
+        frame["stress_momentum_signal"] = np.where(high, np.sign(frame["log_ret"]), 0.0)
+        frame["stress_reversal_signal"] = np.where(high, -np.sign(frame["log_ret"]), 0.0)
+        frame["stress_ns_signal"] = np.where(high, np.sign(frame["u_predicted_next"]), 0.0)
+        frame["stress_momentum_position"] = frame["stress_momentum_signal"].shift(1).fillna(0.0)
+        frame["stress_reversal_position"] = frame["stress_reversal_signal"].shift(1).fillna(0.0)
+        frame["stress_ns_position"] = frame["stress_ns_signal"].shift(1).fillna(0.0)
         frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
 
         previous_position = frame["position"].shift(1).fillna(0.0)
@@ -560,11 +647,26 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             - 1.0
         )
 
+        def _apply_probe(position_col: str, prefix: str):
+            p = frame[position_col]
+            prev = p.shift(1).fillna(0.0)
+            turn = (p - prev).abs()
+            gross = p * frame["log_ret"]
+            net = (1.0 + gross) * (1.0 - cost_rate * turn) - 1.0
+            frame[f"{prefix}_gross_ret"] = gross
+            frame[f"{prefix}_net_ret"] = net
+            frame[f"{prefix}_turnover"] = turn
+
+        _apply_probe("stress_momentum_position", "stress_momentum")
+        _apply_probe("stress_reversal_position", "stress_reversal")
+        _apply_probe("stress_ns_position", "stress_ns")
+
         day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
         needed = [
             "u", "rho", "A_advection", "P_pressure", "D_diffusion",
             "net_force", "flow_to_liquidity", "amplification_minus_damping",
             "cancellation_stress", "criticality", "u_predicted_next",
+            "instability_v2", "instability_v2_threshold",
             "position", "log_ret", "gross_strategy_ret", "net_strategy_ret",
         ]
         day = day.dropna(subset=needed)
@@ -616,6 +718,53 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             high_dir_accuracy = float(
                 np.mean(predicted_dir == actual_next_dir) * 100.0
             )
+
+        # V2 magnitude validation
+        predictive_v2 = day.dropna(
+            subset=[
+                "instability_v2", "instability_v2_threshold",
+                "next_abs_log_ret", "next_rv3", "next_rv6",
+                "large_move_cutoff",
+            ]
+        ).copy()
+        high_v2 = predictive_v2["high_instability_v2"].astype(bool)
+        n_high_v2 = int(high_v2.sum())
+        n_low_v2 = int((~high_v2).sum())
+
+        def _mean_pct(mask: pd.Series, col: str):
+            if int(mask.sum()) == 0:
+                return None
+            return float(predictive_v2.loc[mask, col].mean() * 100.0)
+
+        high_abs1 = _mean_pct(high_v2, "next_abs_log_ret")
+        low_abs1 = _mean_pct(~high_v2, "next_abs_log_ret")
+        high_rv3 = _mean_pct(high_v2, "next_rv3")
+        low_rv3 = _mean_pct(~high_v2, "next_rv3")
+        high_rv6 = _mean_pct(high_v2, "next_rv6")
+        low_rv6 = _mean_pct(~high_v2, "next_rv6")
+        large_move_precision = (
+            float(predictive_v2.loc[high_v2, "next_hour_large_move"].mean() * 100.0)
+            if n_high_v2 else None
+        )
+        large_move_baseline = float(
+            predictive_v2["next_hour_large_move"].mean() * 100.0
+        ) if len(predictive_v2) else None
+
+        def _lift(high_value, low_value):
+            if high_value is None or low_value in (None, 0):
+                return None
+            return float(high_value / low_value)
+
+        def _probe_result(prefix: str):
+            g = day.dropna(subset=[f"{prefix}_net_ret", f"{prefix}_gross_ret"])
+            gross = float(np.exp(g[f"{prefix}_gross_ret"].sum()) - 1.0)
+            net = float(np.prod(1.0 + g[f"{prefix}_net_ret"]) - 1.0)
+            return {
+                "gross_return_pct": gross * 100.0,
+                "net_return_pct": net * 100.0,
+                "total_turnover": float(g[f"{prefix}_turnover"].sum()),
+                "active_hours": int((day[prefix + "_turnover"] > 0).sum()),
+            }
 
         daily_rows = []
         for trading_date, g in day.groupby(day.index.floor("D")):
@@ -744,6 +893,40 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "mean_next_hour_abs_return_pct_otherwise": normal_stress_next_abs,
                 "direction_accuracy_next_hour_when_high_stress_pct": high_dir_accuracy,
             },
+            "instability_v2": {
+                "design": (
+                    "equal-weight causal z-scores of swap-flow/active-liquidity pressure, "
+                    "positive nonlinear amplification over diffusion, and active-liquidity deficit; "
+                    "stress threshold is trailing-7d 90th percentile shifted by one hour"
+                ),
+                "evaluated_hours": int(len(predictive_v2)),
+                "high_instability_hours": n_high_v2,
+                "other_hours": n_low_v2,
+                "score_vs_next_abs_return_corr": _safe_corr(
+                    predictive_v2["instability_v2"], predictive_v2["next_abs_log_ret"]
+                ),
+                "mean_next_1h_abs_return_pct_high": high_abs1,
+                "mean_next_1h_abs_return_pct_other": low_abs1,
+                "next_1h_magnitude_lift": _lift(high_abs1, low_abs1),
+                "mean_next_3h_realized_magnitude_pct_high": high_rv3,
+                "mean_next_3h_realized_magnitude_pct_other": low_rv3,
+                "next_3h_magnitude_lift": _lift(high_rv3, low_rv3),
+                "mean_next_6h_realized_magnitude_pct_high": high_rv6,
+                "mean_next_6h_realized_magnitude_pct_other": low_rv6,
+                "next_6h_magnitude_lift": _lift(high_rv6, low_rv6),
+                "large_move_definition": "next |1h return| > causal trailing-7d 75th percentile",
+                "large_move_precision_pct_when_high": large_move_precision,
+                "large_move_unconditional_rate_pct": large_move_baseline,
+                "large_move_precision_lift": _lift(
+                    large_move_precision, large_move_baseline
+                ),
+            },
+            "stress_gated_direction_probes": {
+                "cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
+                "momentum": _probe_result("stress_momentum"),
+                "reversal": _probe_result("stress_reversal"),
+                "ns_direction": _probe_result("stress_ns"),
+            },
             "highest_criticality_hours": top_events,
             "daily": daily_rows,
             "hourly": hourly,
@@ -773,6 +956,13 @@ def ns_criticality_aug15_selftest():
 def ns_criticality_august_selftest():
     return ns_criticality_day(
         NavierStokesDayRequest(date="2026-08-01", days=31)
+    )
+
+
+@api.get("/selftest/ns-instability-july")
+def ns_instability_july_selftest():
+    return ns_criticality_day(
+        NavierStokesDayRequest(date="2026-07-01", days=31)
     )
 
 
