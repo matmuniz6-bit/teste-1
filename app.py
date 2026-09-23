@@ -451,11 +451,6 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
                 | (x["timestamp"].dt.microsecond != 0)
             ).sum()
         )
-        if missing_hours or extra_hours or off_grid_timestamps:
-            raise RuntimeError(
-                "Hourly data continuity check failed: "
-                f"missing={missing_hours}, extra={extra_hours}, off_grid={off_grid_timestamps}"
-            )
         data_quality = {
             "raw_rows": raw_rows,
             "rows_after_cleaning": int(len(x)),
@@ -465,7 +460,11 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
             "off_grid_timestamps": off_grid_timestamps,
             "data_start": str(actual_index.min()),
             "data_end": str(actual_index.max()),
-            "hourly_continuity_ok": True,
+            "hourly_continuity_ok": (
+                missing_hours == 0
+                and extra_hours == 0
+                and off_grid_timestamps == 0
+            ),
         }
 
         x["bar_ret"] = x["close"].pct_change()
@@ -516,8 +515,11 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
         ].copy()
 
         # Critical anti-lookahead rule from the study: today's daytime reversal
-        # sees only yesterday's daytime return.
-        sessions["previous_day_ret"] = sessions["day_ret"].shift(1)
+        # sees only yesterday's daytime return. Never bridge a missing calendar
+        # trading date: after a gap, the dynamic daytime signal is CASH.
+        previous_day = sessions["day_ret"].shift(1)
+        consecutive_day = sessions.index.to_series().diff().eq(pd.Timedelta(days=1))
+        sessions["previous_day_ret"] = previous_day.where(consecutive_day, np.nan)
         sessions["night_position"] = 1.0
         sessions["day_position"] = -np.sign(sessions["previous_day_ret"].fillna(0.0))
 
@@ -675,9 +677,13 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
                 "fetch_end": str(pd.Timestamp(fetch_end)),
                 "requested_trading_dates": requested_dates,
                 "complete_trading_dates": int(len(evaluated)),
-                "dropped_or_incomplete_dates": int(max(requested_dates - len(evaluated), 0)),
+                "dropped_or_unavailable_dates": int(max(requested_dates - len(evaluated), 0)),
+                "coverage_pct": float(len(evaluated) / requested_dates * 100.0),
+                "first_trading_date_available": str(pd.Timestamp(evaluated.index.min()).date()),
+                "last_trading_date_available": str(pd.Timestamp(evaluated.index.max()).date()),
                 "first_session_bar": str(evaluated["night_first_bar"].min()),
                 "last_session_bar": str(evaluated["day_last_bar"].max()),
+                "gap_reset_to_cash_count": int(evaluated["previous_day_ret"].isna().sum()),
             },
             "data_quality": data_quality,
             "benchmark": {
@@ -695,7 +701,8 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
                     "positions +1/0/-1",
                     "0/1/2 bps turnover-cost scenarios",
                     "buy-and-hold Long/Long benchmark under the same turnover costs",
-                    "explicit hourly continuity validation",
+                    "explicit hourly continuity diagnostics",
+                    "dynamic signal resets to cash after missing calendar trading dates",
                     "annualized daily volatility",
                     "no lookahead",
                 ],
