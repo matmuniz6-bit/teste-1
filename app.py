@@ -400,9 +400,9 @@ def long_reversal_backtest(req: LongReversalBacktestRequest):
             fee_tier=0.0005,
         )
 
-        # One full warm-up day is needed to know the previous daytime session
-        # before the first requested trading date.
-        fetch_start = (start - pd.Timedelta(days=1)).to_pydatetime()
+        # Two warm-up days ensure the previous trading-date row itself has
+        # a complete night + day pair before we shift its daytime return.
+        fetch_start = (start - pd.Timedelta(days=2)).to_pydatetime()
         fetch_end = end.to_pydatetime()
         candles = client.fetch_candles_by_pair_ids(
             [pair.pair_id],
