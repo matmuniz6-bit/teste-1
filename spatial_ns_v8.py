@@ -193,6 +193,16 @@ def _forecast(m0: np.ndarray, c0: np.ndarray, op: SpatialOperator, hours: int = 
     return m, c
 
 
+def _orthonormal_dct_basis(n: int) -> np.ndarray:
+    """DCT-II orthonormal basis: broad modes first, narrower modes later."""
+    basis = np.zeros((n, n), dtype=float)
+    for k in range(n):
+        alpha = math.sqrt(1.0 / n) if k == 0 else math.sqrt(2.0 / n)
+        for j in range(n):
+            basis[k, j] = alpha * math.cos(math.pi * (j + 0.5) * k / n)
+    return basis
+
+
 def _build_spatial_fields(q: pd.DataFrame, n_bins: int = 7) -> pd.DataFrame:
     q = q.copy()
     q["hour"] = q["timestamp"].dt.floor("h")
@@ -238,11 +248,30 @@ def _build_spatial_fields(q: pd.DataFrame, n_bins: int = 7) -> pd.DataFrame:
     pivot = pivot.reindex(columns=list(range(n_bins)), fill_value=0.0)
     counts = q.groupby("hour").size().reindex(pivot.index).clip(lower=1)
     pivot = pivot.div(np.sqrt(counts), axis=0)
-    pivot.columns = [f"a_raw_{i}" for i in range(n_bins)]
+    pivot.columns = [f"x_bin_{i}" for i in range(n_bins)]
 
-    hist_mean = pivot.rolling(168, min_periods=48).mean().shift(1)
-    hist_std = pivot.rolling(168, min_periods=48).std().shift(1).replace(0, np.nan)
-    z = ((pivot - hist_mean) / hist_std).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-8, 8)
+    # The selected model requires patterns at multiple spatial widths/scales.
+    # Project the localized tick field into an orthonormal DCT basis:
+    # low-order coefficients describe broad structures, high-order coefficients
+    # describe progressively narrower oscillatory structures.
+    basis = _orthonormal_dct_basis(n_bins)
+    mode_values = pivot.to_numpy(dtype=float) @ basis.T
+    modes = pd.DataFrame(
+        mode_values,
+        index=pivot.index,
+        columns=[f"mode_raw_{i}" for i in range(n_bins)],
+    )
+
+    # Causal local standardisation makes the reduced coefficients comparable
+    # across years without using current/future observations in the scale.
+    hist_mean = modes.rolling(168, min_periods=48).mean().shift(1)
+    hist_std = modes.rolling(168, min_periods=48).std().shift(1).replace(0, np.nan)
+    z = ((modes - hist_mean) / hist_std).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-8, 8)
+
+    # The reduced-order state should represent coherent structures rather than
+    # raw minute noise. A 3-hour causal EWM is a filter, not a lookahead:
+    # the coefficient at t uses observations only through t.
+    z = z.ewm(span=3, adjust=False).mean()
     z.columns = [f"a_{i}" for i in range(n_bins)]
     return z
 
@@ -590,7 +619,7 @@ def run_v8_spatial(
             "coordinate": "co-moving realised tick coordinate scaled by past 24h tick range",
             "signed_quote_flow_source": quote_flow_source,
             "depth_proxy": "active liquidity normalized by past minute liquidity",
-            "basis": "localized disjoint tick-space indicators (orthogonal discrete basis)",
+            "basis": "localized tick field projected to an orthonormal multiscale DCT basis; 3h causal EWM state filter",
             "limitation": (
                 "This reconstructs flow-pressure over realised tick traversal, not the full historical "
                 "LP liquidity distribution across all initialized ticks."
@@ -609,6 +638,17 @@ def run_v8_spatial(
             "mean_lambda": float(target_frame["v8_lambda"].mean()),
             "mean_pi": float(target_frame["v8_pi"].mean()),
             "mean_cov_dissipation": float(target_frame["v8_diss_cov"].mean()),
+            "score_positive_rate_pct": float((target_frame["v8_score"] > 0).mean() * 100.0),
+            "width_contraction_rate_pct": float((target_frame["v8_ell_hat"] < target_frame["v8_ell"]).mean() * 100.0),
+            "lambda_positive_rate_pct": float((target_frame["v8_lambda"] > 0).mean() * 100.0),
+            "score_quantiles": {
+                str(q): float(target_frame["v8_score"].quantile(q))
+                for q in (0.01, 0.10, 0.50, 0.90, 0.99)
+            },
+            "lambda_quantiles": {
+                str(q): float(target_frame["v8_lambda"].quantile(q))
+                for q in (0.01, 0.10, 0.50, 0.90, 0.99)
+            },
         },
         "magnitude_tests": {
             "concentration": mag_stats("v8_concentration"),
