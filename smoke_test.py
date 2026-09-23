@@ -8,6 +8,7 @@ import sys
 
 from app import (
     NativeBacktestRequest,
+    demeter_selftest,
     health,
     native_backtest,
     trading_strategy_selftest,
@@ -47,6 +48,19 @@ def main():
         "resolved_pair": result["resolved_pair"],
         "dataset": result["dataset"],
         "result": result["result"],
+    })
+
+    demeter = demeter_selftest()
+    assert demeter["status"] == "ok"
+    assert demeter["source"] == "Trading Strategy CLMM"
+    assert demeter["clmm_rows"] > 0
+    assert demeter["demeter"]["loaded_rows"] > 0
+    assert demeter["demeter"]["price_rows"] > 0
+    print("SMOKE demeter_clmm: OK", {
+        "pair": demeter["pair"],
+        "request": demeter["request"],
+        "clmm_rows": demeter["clmm_rows"],
+        "demeter": demeter["demeter"],
     })
 
 
