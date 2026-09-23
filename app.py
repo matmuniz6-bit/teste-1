@@ -12,7 +12,6 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 
 from market_data import resolve_pair_lightweight
-from spatial_strategy import build_spatial_v8
 from pydantic import BaseModel, Field
 
 
@@ -588,19 +587,6 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         frame["log_ret"] = np.log(frame["close"]).diff()
         frame["simple_ret"] = np.expm1(frame["log_ret"])
 
-        # V8 spatial reduced-order model. This is joined before the legacy
-        # scalar detectors so the same hourly target can be evaluated side-by-side.
-        # The observation layer is a documented proxy because Trading Strategy
-        # does not expose the full historical LP liquidity curve per initialized tick.
-        v8 = build_spatial_v8(
-            q_idx,
-            frame.index,
-            horizon_hours=3,
-            stat_window_hours=72,
-            fit_window_hours=720,
-            refit_every_hours=24,
-        )
-        frame = frame.join(v8, how="left")
         vol_med = frame["volume"].rolling(24, min_periods=12).median()
         frame["volume_ratio"] = (frame["volume"] / vol_med.replace(0, np.nan)).clip(0.05, 20.0)
 
