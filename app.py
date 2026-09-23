@@ -815,6 +815,100 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         frame["v4_confirmed_momentum_3h_position"] = event_pos_confirmed
         frame["v4_confirmed_momentum_3h_trigger"] = event_trigger_confirmed
 
+        # V5 adaptive direction layer. The detector remains unchanged.
+        # Direction regime is learned only from fully completed PRIOR stress events.
+        # No future event outcome can affect the current decision.
+        def _build_adaptive_event_strategy(mode: str, hold_hours: int = 3, history_events: int = 20):
+            pos = np.zeros(len(frame), dtype=float)
+            trig = np.zeros(len(frame), dtype=bool)
+            chosen = np.zeros(len(frame), dtype=float)
+            event_records = []  # (completion_index, aligned_momentum_log_return)
+            known_outcomes = []
+
+            for i in range(len(frame) - 1):
+                # Make outcomes available only after their full holding window ended.
+                still_pending = []
+                for completion_i, outcome in event_records:
+                    if completion_i <= i:
+                        known_outcomes.append(outcome)
+                    else:
+                        still_pending.append((completion_i, outcome))
+                event_records = still_pending
+
+                if not bool(rising_edge.iloc[i]):
+                    continue
+
+                start_i = i + 1
+                end_i = min(i + 1 + hold_hours, len(frame))
+                if end_i - start_i < hold_hours:
+                    continue
+                if np.any(pos[start_i:end_i] != 0):
+                    continue
+
+                base_direction = float(np.sign(frame["log_ret"].iloc[i]))
+                if base_direction == 0.0:
+                    continue
+
+                recent = known_outcomes[-history_events:]
+                regime_score = float(np.mean(recent)) if len(recent) >= 8 else None
+
+                if mode == "momentum_or_cash":
+                    direction = base_direction if (regime_score is None or regime_score > 0.0) else 0.0
+                elif mode == "momentum_or_reversal":
+                    direction = base_direction if (regime_score is None or regime_score >= 0.0) else -base_direction
+                else:
+                    raise ValueError(mode)
+
+                if direction != 0.0:
+                    pos[start_i:end_i] = direction
+                    trig[i] = True
+                    chosen[i] = direction
+
+                # Record the baseline momentum outcome regardless of chosen V5 action.
+                # It becomes visible to future decisions only after completion_i.
+                future_log = float(frame["log_ret"].iloc[start_i:end_i].sum())
+                aligned_outcome = base_direction * future_log
+                event_records.append((end_i - 1, aligned_outcome))
+
+            return pos, trig, chosen
+
+        v5_cash_pos, v5_cash_trig, v5_cash_dir = _build_adaptive_event_strategy(
+            "momentum_or_cash", hold_hours=3, history_events=20
+        )
+        v5_flip_pos, v5_flip_trig, v5_flip_dir = _build_adaptive_event_strategy(
+            "momentum_or_reversal", hold_hours=3, history_events=20
+        )
+        frame["v5_adaptive_cash_position"] = v5_cash_pos
+        frame["v5_adaptive_cash_trigger"] = v5_cash_trig
+        frame["v5_adaptive_cash_direction"] = v5_cash_dir
+        frame["v5_adaptive_flip_position"] = v5_flip_pos
+        frame["v5_adaptive_flip_trigger"] = v5_flip_trig
+        frame["v5_adaptive_flip_direction"] = v5_flip_dir
+
+        # Second causal regime test: sign of trailing 7-day lag-1 autocorrelation.
+        frame["lag1_autocorr_168"] = (
+            frame["log_ret"].rolling(168, min_periods=72).corr(frame["log_ret"].shift(1))
+        )
+        autocorr_trigger = rising_edge.fillna(False)
+        auto_pos = np.zeros(len(frame), dtype=float)
+        auto_trig = np.zeros(len(frame), dtype=bool)
+        for i in range(len(frame) - 1):
+            if not bool(autocorr_trigger.iloc[i]):
+                continue
+            start_i = i + 1
+            end_i = min(i + 4, len(frame))
+            if end_i - start_i < 3 or np.any(auto_pos[start_i:end_i] != 0):
+                continue
+            base_direction = float(np.sign(frame["log_ret"].iloc[i]))
+            corr = frame["lag1_autocorr_168"].iloc[i]
+            if base_direction == 0.0 or pd.isna(corr):
+                continue
+            direction = base_direction if corr >= 0.0 else -base_direction
+            auto_pos[start_i:end_i] = direction
+            auto_trig[i] = True
+        frame["v5_autocorr_adaptive_position"] = auto_pos
+        frame["v5_autocorr_adaptive_trigger"] = auto_trig
+
         # Predeclared V3 momentum-continuation research gates.
         # These are locked before inspecting the prior 12-month holdout.
         abs_ret_median = (
@@ -893,6 +987,9 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         _apply_probe("event_momentum_3h_position", "event_momentum_3h")
         _apply_probe("v4_event_momentum_3h_position", "v4_event_momentum_3h")
         _apply_probe("v4_confirmed_momentum_3h_position", "v4_confirmed_momentum_3h")
+        _apply_probe("v5_adaptive_cash_position", "v5_adaptive_cash")
+        _apply_probe("v5_adaptive_flip_position", "v5_adaptive_flip")
+        _apply_probe("v5_autocorr_adaptive_position", "v5_autocorr_adaptive")
         for prefix in candidate_prefixes:
             _apply_probe(f"{prefix}_position", prefix)
 
@@ -1262,6 +1359,27 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 **_probe_result("event_momentum_3h"),
                 "cost_sensitivity_bps": _probe_cost_sensitivity("event_momentum_3h"),
                 "event_triggers": int(day["event_momentum_3h_trigger"].sum()),
+            },
+            "v5_adaptive_direction": {
+                "event_history_rule": (
+                    "last 20 fully completed V3 stress events; require at least 8 before adapting; "
+                    "baseline momentum outcome is revealed only after its 3h window completes"
+                ),
+                "momentum_or_cash": {
+                    **_probe_result("v5_adaptive_cash"),
+                    "cost_sensitivity_bps": _probe_cost_sensitivity("v5_adaptive_cash"),
+                    "event_triggers": int(day["v5_adaptive_cash_trigger"].sum()),
+                },
+                "momentum_or_reversal": {
+                    **_probe_result("v5_adaptive_flip"),
+                    "cost_sensitivity_bps": _probe_cost_sensitivity("v5_adaptive_flip"),
+                    "event_triggers": int(day["v5_adaptive_flip_trigger"].sum()),
+                },
+                "trailing_7d_autocorr_direction": {
+                    **_probe_result("v5_autocorr_adaptive"),
+                    "cost_sensitivity_bps": _probe_cost_sensitivity("v5_autocorr_adaptive"),
+                    "event_triggers": int(day["v5_autocorr_adaptive_trigger"].sum()),
+                },
             },
             "v3_momentum_gate_research": {
                 prefix.replace("v3gate_", ""): {
