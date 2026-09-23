@@ -146,7 +146,7 @@ class LongReversalBacktestRequest(BaseModel):
 
     start: str = "2026-08-01T00:00:00Z"
     end: str = "2026-09-01T00:00:00Z"
-    initial_capital: float = Field(default=10_000, gt=0)
+    initial_capital: float = Field(default=100, gt=0)
     transaction_costs_bps: list[int] = Field(default_factory=lambda: [0, 1, 2])
 
 
