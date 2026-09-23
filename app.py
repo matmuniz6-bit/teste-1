@@ -458,7 +458,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         q["timestamp"] = pd.to_datetime(q[ts_col], utc=True).dt.tz_convert(None)
         q = q.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
         for col in (
-            "current_liquidity", "high_tick", "low_tick",
+            "current_liquidity", "open_tick", "close_tick", "high_tick", "low_tick",
             "in_amount0", "in_amount1", "net_amount0", "net_amount1",
         ):
             if col in q.columns:
@@ -478,12 +478,29 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 q[f"abs_{col}"] = q[col].abs()
                 agg_map[f"abs_{col}"] = "sum"
 
-        liq = (
-            q.set_index("timestamp")
-            .sort_index()
-            .resample("1h")
-            .agg(agg_map)
-        )
+        q_idx = q.set_index("timestamp").sort_index()
+        liq = q_idx.resample("1h").agg(agg_map)
+
+        # V4 spatial proxies from the minute-level price path.
+        # These describe where swaps moved the price through tick space; they
+        # are NOT a full LP liquidity distribution across initialized ticks.
+        if "close_tick" in q_idx.columns:
+            tick_stats = q_idx["close_tick"].resample("1h").agg(["std", "min", "max"])
+            tick_stats = tick_stats.rename(columns={
+                "std": "tick_path_dispersion",
+                "min": "tick_path_min",
+                "max": "tick_path_max",
+            })
+            tick_stats["tick_path_range"] = (
+                tick_stats["tick_path_max"] - tick_stats["tick_path_min"]
+            ).abs()
+            liq = liq.join(tick_stats, how="left")
+
+        if "high_tick" in q_idx.columns and "low_tick" in q_idx.columns:
+            high_hour = q_idx["high_tick"].resample("1h").max()
+            low_hour = q_idx["low_tick"].resample("1h").min()
+            liq["tick_extreme_range"] = (high_hour - low_hour).abs()
+
         frame = h.join(liq, how="inner")
         frame = frame[
             (frame.index >= fetch_start)
@@ -621,6 +638,69 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             frame["instability_v2"] > frame["instability_v2_threshold"]
         )
 
+        # V4: spatial-localisation approximation inspired by the newer
+        # Navier-Stokes concentration mechanism.
+        # We only have the realised minute-by-minute tick path, not the full
+        # Uniswap LP distribution across initialized ticks.
+        spatial_width = (
+            frame["tick_path_dispersion"]
+            if "tick_path_dispersion" in frame.columns
+            else frame.get("tick_span", pd.Series(index=frame.index, dtype=float))
+        )
+        width_med = spatial_width.rolling(72, min_periods=24).median().shift(1)
+        frame["spatial_width_ratio_v4"] = (
+            spatial_width / width_med.replace(0, np.nan)
+        ).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.05, 20.0)
+
+        # Concentrated throughput: large swap flow through a locally narrow
+        # price-space path under weak active liquidity.
+        frame["flow_localisation_v4"] = (
+            frame["swap_flow_intensity"]
+            / frame["rho"].clip(lower=0.10)
+            / (1.0 + frame["spatial_width_ratio_v4"])
+        )
+
+        # Spatial strain is retained as a diagnostic: large flow producing a
+        # wide tick excursion under weak liquidity.
+        frame["spatial_strain_v4"] = (
+            frame["swap_flow_intensity"]
+            * frame["spatial_width_ratio_v4"]
+            / frame["rho"].clip(lower=0.10)
+        )
+
+        # Energy proxy. Unlike physical kinetic energy this is dimensionless
+        # and uses realised tick-path width as the local spatial scale.
+        frame["energy_proxy_v4"] = (
+            frame["rho"].clip(lower=0.10)
+            * frame["spatial_width_ratio_v4"]
+            * frame["u"].pow(2)
+        )
+
+        frame["z_localisation_v4"] = causal_z(np.log1p(frame["flow_localisation_v4"]))
+        frame["z_spatial_strain_v4"] = causal_z(np.log1p(frame["spatial_strain_v4"]))
+        frame["z_energy_v4"] = causal_z(np.log1p(frame["energy_proxy_v4"]))
+        frame["z_cancellation_v4"] = causal_z(np.log1p(frame["cancellation_stress"]))
+
+        # Core V4 state: spatially localised flow + positive nonlinear
+        # amplification + liquidity deficit + large hidden-term cancellation.
+        # Equal weights are predeclared; no 12-month fit is performed.
+        frame["instability_v4"] = (
+            frame["z_localisation_v4"]
+            + frame["z_amplification_v2"]
+            + frame["z_liquidity_deficit_v2"]
+            + frame["z_cancellation_v4"]
+        ) / 4.0
+
+        frame["instability_v4_threshold"] = (
+            frame["instability_v4"]
+            .rolling(168, min_periods=48)
+            .quantile(0.90)
+            .shift(1)
+        )
+        frame["high_instability_v4"] = (
+            frame["instability_v4"] > frame["instability_v4_threshold"]
+        )
+
         # Same damped integration spirit as the paper, but fully causal.
         frame["u_predicted_next"] = (
             frame["u"] + req.integration_gain * frame["net_force"]
@@ -678,6 +758,28 @@ def ns_criticality_day(req: NavierStokesDayRequest):
 
         frame["event_momentum_3h_position"] = event_pos
         frame["event_momentum_3h_trigger"] = event_trigger
+
+        # V4 uses the same untouched execution rule as V3 so only the detector
+        # changes: rising-edge V4 event -> completed-hour momentum -> next 3h.
+        high_v4 = frame["high_instability_v4"].fillna(False)
+        rising_edge_v4 = high_v4 & (~high_v4.shift(1).fillna(False))
+        event_pos_v4 = np.zeros(len(frame), dtype=float)
+        event_trigger_v4 = np.zeros(len(frame), dtype=bool)
+        for i in range(len(frame) - 1):
+            if not bool(rising_edge_v4.iloc[i]):
+                continue
+            direction = float(np.sign(frame["log_ret"].iloc[i]))
+            if direction == 0.0:
+                continue
+            start_i = i + 1
+            end_i = min(i + 4, len(frame))
+            if np.any(event_pos_v4[start_i:end_i] != 0):
+                continue
+            event_pos_v4[start_i:end_i] = direction
+            event_trigger_v4[i] = True
+
+        frame["v4_event_momentum_3h_position"] = event_pos_v4
+        frame["v4_event_momentum_3h_trigger"] = event_trigger_v4
         frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
 
         previous_position = frame["position"].shift(1).fillna(0.0)
@@ -703,6 +805,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         _apply_probe("stress_reversal_position", "stress_reversal")
         _apply_probe("stress_ns_position", "stress_ns")
         _apply_probe("event_momentum_3h_position", "event_momentum_3h")
+        _apply_probe("v4_event_momentum_3h_position", "v4_event_momentum_3h")
 
         day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
         needed = [
@@ -710,6 +813,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             "net_force", "flow_to_liquidity", "amplification_minus_damping",
             "cancellation_stress", "criticality", "u_predicted_next",
             "instability_v2", "instability_v2_threshold",
+            "instability_v4", "instability_v4_threshold",
             "position", "log_ret", "gross_strategy_ret", "net_strategy_ret",
         ]
         day = day.dropna(subset=needed)
@@ -793,6 +897,37 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             predictive_v2["next_hour_large_move"].mean() * 100.0
         ) if len(predictive_v2) else None
 
+        predictive_v4 = day.dropna(
+            subset=[
+                "instability_v4", "instability_v4_threshold",
+                "next_abs_log_ret", "next_rv3", "next_rv6",
+                "large_move_cutoff",
+            ]
+        ).copy()
+        high_v4_eval = predictive_v4["high_instability_v4"].astype(bool)
+        n_high_v4 = int(high_v4_eval.sum())
+        n_low_v4 = int((~high_v4_eval).sum())
+
+        def _mean_pct_v4(mask: pd.Series, col: str):
+            if int(mask.sum()) == 0:
+                return None
+            return float(predictive_v4.loc[mask, col].mean() * 100.0)
+
+        v4_high_abs1 = _mean_pct_v4(high_v4_eval, "next_abs_log_ret")
+        v4_low_abs1 = _mean_pct_v4(~high_v4_eval, "next_abs_log_ret")
+        v4_high_rv3 = _mean_pct_v4(high_v4_eval, "next_rv3")
+        v4_low_rv3 = _mean_pct_v4(~high_v4_eval, "next_rv3")
+        v4_high_rv6 = _mean_pct_v4(high_v4_eval, "next_rv6")
+        v4_low_rv6 = _mean_pct_v4(~high_v4_eval, "next_rv6")
+        v4_large_move_precision = (
+            float(predictive_v4.loc[high_v4_eval, "next_hour_large_move"].mean() * 100.0)
+            if n_high_v4 else None
+        )
+        v4_large_move_baseline = (
+            float(predictive_v4["next_hour_large_move"].mean() * 100.0)
+            if len(predictive_v4) else None
+        )
+
         def _lift(high_value, low_value):
             if high_value is None or low_value in (None, 0):
                 return None
@@ -846,6 +981,7 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         for month, g in day.groupby(day.index.to_period("M")):
             v2_curve = (1.0 + g["stress_momentum_net_ret"]).cumprod()
             v3_curve = (1.0 + g["event_momentum_3h_net_ret"]).cumprod()
+            v4_curve = (1.0 + g["v4_event_momentum_3h_net_ret"]).cumprod()
             monthly_rows.append({
                 "month": str(month),
                 "hours": int(len(g)),
@@ -856,8 +992,13 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "v3_event_momentum_3h_net_return_pct": (
                     float((v3_curve.iloc[-1] - 1.0) * 100.0) if len(v3_curve) else 0.0
                 ),
+                "v4_event_momentum_3h_net_return_pct": (
+                    float((v4_curve.iloc[-1] - 1.0) * 100.0) if len(v4_curve) else 0.0
+                ),
                 "v3_turnover": float(g["event_momentum_3h_turnover"].sum()),
                 "v3_event_triggers": int(g["event_momentum_3h_trigger"].sum()),
+                "v4_turnover": float(g["v4_event_momentum_3h_turnover"].sum()),
+                "v4_event_triggers": int(g["v4_event_momentum_3h_trigger"].sum()),
             })
 
         top = (
@@ -1007,6 +1148,55 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 **_probe_result("event_momentum_3h"),
                 "event_triggers": int(day["event_momentum_3h_trigger"].sum()),
             },
+            "instability_v4_spatial": {
+                "design": (
+                    "equal-weight causal z-scores of flow localisation in realised tick-space, "
+                    "positive nonlinear amplification over diffusion, active-liquidity deficit, "
+                    "and hidden-term cancellation; threshold is trailing-7d 90th percentile shifted 1h"
+                ),
+                "spatial_proxy_limitation": (
+                    "tick-path dispersion is realised price-space traversal, not the full Uniswap "
+                    "liquidity distribution across initialized ticks"
+                ),
+                "evaluated_hours": int(len(predictive_v4)),
+                "high_instability_hours": n_high_v4,
+                "other_hours": n_low_v4,
+                "score_vs_next_abs_return_corr": _safe_corr(
+                    predictive_v4["instability_v4"], predictive_v4["next_abs_log_ret"]
+                ),
+                "localisation_vs_next_abs_return_corr": _safe_corr(
+                    predictive_v4["flow_localisation_v4"], predictive_v4["next_abs_log_ret"]
+                ),
+                "spatial_strain_vs_next_abs_return_corr": _safe_corr(
+                    predictive_v4["spatial_strain_v4"], predictive_v4["next_abs_log_ret"]
+                ),
+                "energy_proxy_vs_next_abs_return_corr": _safe_corr(
+                    predictive_v4["energy_proxy_v4"], predictive_v4["next_abs_log_ret"]
+                ),
+                "mean_next_1h_abs_return_pct_high": v4_high_abs1,
+                "mean_next_1h_abs_return_pct_other": v4_low_abs1,
+                "next_1h_magnitude_lift": _lift(v4_high_abs1, v4_low_abs1),
+                "mean_next_3h_realized_magnitude_pct_high": v4_high_rv3,
+                "mean_next_3h_realized_magnitude_pct_other": v4_low_rv3,
+                "next_3h_magnitude_lift": _lift(v4_high_rv3, v4_low_rv3),
+                "mean_next_6h_realized_magnitude_pct_high": v4_high_rv6,
+                "mean_next_6h_realized_magnitude_pct_other": v4_low_rv6,
+                "next_6h_magnitude_lift": _lift(v4_high_rv6, v4_low_rv6),
+                "large_move_precision_pct_when_high": v4_large_move_precision,
+                "large_move_unconditional_rate_pct": v4_large_move_baseline,
+                "large_move_precision_lift": _lift(
+                    v4_large_move_precision, v4_large_move_baseline
+                ),
+            },
+            "v4_event_momentum_3h": {
+                "logic": (
+                    "rising-edge V4 spatial-instability event; completed-hour momentum "
+                    "sets direction for the next 3 hours; overlapping events ignored"
+                ),
+                "cost_bps_per_turnover": req.illustrative_cost_bps_per_turnover,
+                **_probe_result("v4_event_momentum_3h"),
+                "event_triggers": int(day["v4_event_momentum_3h_trigger"].sum()),
+            },
             "highest_criticality_hours": top_events,
             "daily": daily_rows,
             "monthly": monthly_rows,
@@ -1051,6 +1241,13 @@ def ns_instability_july_selftest():
 def ns_instability_12m_selftest():
     return ns_criticality_day(
         NavierStokesDayRequest(date="2025-09-01", days=365)
+    )
+
+
+@api.get("/selftest/ns-instability-v4-prior-12m")
+def ns_instability_v4_prior_12m_selftest():
+    return ns_criticality_day(
+        NavierStokesDayRequest(date="2024-09-01", days=365)
     )
 
 
