@@ -15,6 +15,7 @@ from app import (
     long_reversal_selftest,
     long_reversal_study_period_selftest,
     ns_criticality_aug15_selftest,
+    ns_criticality_august_selftest,
     native_backtest,
     trading_strategy_selftest,
 )
@@ -126,6 +127,18 @@ def main():
         "result": ns_day["result"],
         "next_hour_stress_test": ns_day["next_hour_stress_test"],
         "highest_criticality_hours": ns_day["highest_criticality_hours"],
+    })
+
+    ns_aug = ns_criticality_august_selftest()
+    assert ns_aug["status"] == "ok"
+    assert ns_aug["causality"]["lookahead"] is False
+    assert ns_aug["result"]["requested_days"] == 31
+    assert ns_aug["result"]["complete_hours"] >= 700
+    print("SMOKE ns_criticality_august: OK", {
+        "result": ns_aug["result"],
+        "next_hour_stress_test": ns_aug["next_hour_stress_test"],
+        "highest_criticality_hours": ns_aug["highest_criticality_hours"],
+        "daily": ns_aug["daily"],
     })
 
     aave = aave_selftest()
