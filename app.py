@@ -958,6 +958,16 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             frame[f"{prefix}_trigger"] = trig_c
             candidate_prefixes.append(prefix)
 
+        # V6: test the same momentum direction at the detector's measured
+        # 1h / 3h / 6h magnitude horizons, without changing the trigger.
+        horizon_prefixes = []
+        for hold_hours in (1, 6):
+            pos_h, trig_h = _build_event_momentum(rising_edge, hold_hours=hold_hours)
+            prefix = f"v6_momentum_{hold_hours}h"
+            frame[f"{prefix}_position"] = pos_h
+            frame[f"{prefix}_trigger"] = trig_h
+            horizon_prefixes.append(prefix)
+
         frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
 
         previous_position = frame["position"].shift(1).fillna(0.0)
@@ -991,6 +1001,8 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         _apply_probe("v5_adaptive_flip_position", "v5_adaptive_flip")
         _apply_probe("v5_autocorr_adaptive_position", "v5_autocorr_adaptive")
         for prefix in candidate_prefixes:
+            _apply_probe(f"{prefix}_position", prefix)
+        for prefix in horizon_prefixes:
             _apply_probe(f"{prefix}_position", prefix)
 
         day = frame[(frame.index >= target) & (frame.index < target_end)].copy()
@@ -1379,6 +1391,23 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                     **_probe_result("v5_autocorr_adaptive"),
                     "cost_sensitivity_bps": _probe_cost_sensitivity("v5_autocorr_adaptive"),
                     "event_triggers": int(day["v5_autocorr_adaptive_trigger"].sum()),
+                },
+            },
+            "v6_horizon_research": {
+                "1h": {
+                    **_probe_result("v6_momentum_1h"),
+                    "cost_sensitivity_bps": _probe_cost_sensitivity("v6_momentum_1h"),
+                    "event_triggers": int(day["v6_momentum_1h_trigger"].sum()),
+                },
+                "3h": {
+                    **_probe_result("event_momentum_3h"),
+                    "cost_sensitivity_bps": _probe_cost_sensitivity("event_momentum_3h"),
+                    "event_triggers": int(day["event_momentum_3h_trigger"].sum()),
+                },
+                "6h": {
+                    **_probe_result("v6_momentum_6h"),
+                    "cost_sensitivity_bps": _probe_cost_sensitivity("v6_momentum_6h"),
+                    "event_triggers": int(day["v6_momentum_6h_trigger"].sum()),
                 },
             },
             "v3_momentum_gate_research": {
