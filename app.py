@@ -566,7 +566,13 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             if col in frame.columns:
                 flow_components.append(_ratio_to_trailing_median(frame[col].abs()))
         if flow_components:
-            frame["swap_flow_intensity"] = pd.concat(flow_components, axis=1).mean(axis=1)
+            flow_df = pd.concat(flow_components, axis=1)
+            frame["swap_flow_intensity"] = flow_df.mean(axis=1, skipna=True)
+            frame["swap_flow_intensity"] = (
+                frame["swap_flow_intensity"]
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(frame["volume_ratio"])
+            )
         else:
             # Fallback remains causal if a historical CLMM schema lacks flow columns.
             frame["swap_flow_intensity"] = frame["volume_ratio"]
@@ -579,8 +585,10 @@ def ns_criticality_day(req: NavierStokesDayRequest):
 
         def causal_z(s: pd.Series, window: int = 72) -> pd.Series:
             mean = s.rolling(window, min_periods=24).mean().shift(1)
-            std = s.rolling(window, min_periods=24).std().shift(1).replace(0, np.nan)
-            return ((s - mean) / std).clip(-6, 6)
+            std = s.rolling(window, min_periods=24).std().shift(1)
+            z = (s - mean) / std.replace(0, np.nan)
+            # No historical variance means "no standardized anomaly", not missing data.
+            return z.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-6, 6)
 
         frame["z_flow_pressure_v2"] = causal_z(np.log1p(frame["flow_pressure_v2"]))
         frame["z_amplification_v2"] = causal_z(np.log1p(frame["amplification_v2"]))
