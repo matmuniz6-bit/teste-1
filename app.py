@@ -245,8 +245,15 @@ def native_backtest(req: NativeBacktestRequest):
 
     try:
         from tradeexecutor.backtest.backtest_module import run_backtest_for_module
+        from tradeexecutor.cli.log import setup_logging
         from tradeexecutor.strategy.default_routing_options import TradeRouting
         from tradeexecutor.strategy.reserve_currency import ReserveCurrency
+        import logging as _logging
+
+        # run_backtest_for_module() assumes the trade-executor CLI has already
+        # installed its custom Logger.trade()/trade_high() methods.
+        if not hasattr(_logging.Logger, "trade"):
+            setup_logging(log_level=_logging.INFO)
 
         chain_id = _chain_id(req.chain)
         bucket = _time_bucket(req.time_bucket)
