@@ -13,6 +13,7 @@ from app import (
     health,
     long_reversal_july_selftest,
     long_reversal_selftest,
+    long_reversal_study_period_selftest,
     native_backtest,
     trading_strategy_selftest,
 )
@@ -100,6 +101,16 @@ def main():
         "data_quality": july["data_quality"],
         "benchmark": july["benchmark"],
         "cost_scenarios": july["cost_scenarios"],
+    })
+
+    study_period = long_reversal_study_period_selftest()
+    assert study_period["status"] == "ok"
+    assert study_period["data_quality"]["hourly_continuity_ok"] is True
+    print("SMOKE long_reversal_study_period: OK", {
+        "coverage": study_period["coverage"],
+        "data_quality": study_period["data_quality"],
+        "benchmark": study_period["benchmark"],
+        "cost_scenarios": study_period["cost_scenarios"],
     })
 
     aave = aave_selftest()
