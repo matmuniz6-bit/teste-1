@@ -545,6 +545,8 @@ def ns_criticality_day(req: NavierStokesDayRequest):
             frame["u"] + req.integration_gain * frame["net_force"]
         )
         frame["signal_for_next_hour"] = np.sign(frame["u_predicted_next"])
+        frame["next_log_ret"] = frame["log_ret"].shift(-1)
+        frame["next_abs_log_ret"] = frame["next_log_ret"].abs()
         frame["position"] = frame["signal_for_next_hour"].shift(1).fillna(0.0)
         frame["gross_strategy_ret"] = frame["position"] * frame["log_ret"]
 
@@ -579,6 +581,37 @@ def ns_criticality_day(req: NavierStokesDayRequest):
         gross_total = float(np.exp(day["gross_strategy_ret"].sum()) - 1.0)
         net_total = float(np.prod(1.0 + day["net_strategy_ret"]) - 1.0)
         buy_hold = float(np.exp(day["log_ret"].sum()) - 1.0)
+
+        predictive = day.dropna(subset=["next_abs_log_ret"]).copy()
+        def _safe_corr(a: pd.Series, b: pd.Series) -> float | None:
+            if len(a) < 3 or a.std() == 0 or b.std() == 0:
+                return None
+            value = a.corr(b)
+            return float(value) if pd.notna(value) else None
+
+        high_stress = predictive["criticality"] >= 1.0
+        high_stress_count = int(high_stress.sum())
+        high_stress_next_abs = (
+            float(predictive.loc[high_stress, "next_abs_log_ret"].mean() * 100.0)
+            if high_stress_count
+            else None
+        )
+        normal_stress_next_abs = (
+            float(predictive.loc[~high_stress, "next_abs_log_ret"].mean() * 100.0)
+            if (~high_stress).any()
+            else None
+        )
+        high_dir_accuracy = None
+        if high_stress_count:
+            predicted_dir = np.sign(
+                predictive.loc[high_stress, "u_predicted_next"].to_numpy()
+            )
+            actual_next_dir = np.sign(
+                predictive.loc[high_stress, "next_log_ret"].to_numpy()
+            )
+            high_dir_accuracy = float(
+                np.mean(predicted_dir == actual_next_dir) * 100.0
+            )
 
         top = (
             day.sort_values("criticality", ascending=False)
@@ -659,6 +692,25 @@ def ns_criticality_day(req: NavierStokesDayRequest):
                 "mean_criticality": float(day["criticality"].mean()),
                 "max_criticality": float(day["criticality"].max()),
                 "max_cancellation_stress": float(day["cancellation_stress"].max()),
+            },
+            "next_hour_stress_test": {
+                "criticality_vs_next_abs_return_corr": _safe_corr(
+                    predictive["criticality"], predictive["next_abs_log_ret"]
+                ),
+                "flow_to_liquidity_vs_next_abs_return_corr": _safe_corr(
+                    predictive["flow_to_liquidity"], predictive["next_abs_log_ret"]
+                ),
+                "cancellation_vs_next_abs_return_corr": _safe_corr(
+                    predictive["cancellation_stress"], predictive["next_abs_log_ret"]
+                ),
+                "amplification_vs_next_abs_return_corr": _safe_corr(
+                    predictive["amplification_minus_damping"], predictive["next_abs_log_ret"]
+                ),
+                "high_stress_threshold": 1.0,
+                "high_stress_hours": high_stress_count,
+                "mean_next_hour_abs_return_pct_when_high_stress": high_stress_next_abs,
+                "mean_next_hour_abs_return_pct_otherwise": normal_stress_next_abs,
+                "direction_accuracy_next_hour_when_high_stress_pct": high_dir_accuracy,
             },
             "highest_criticality_hours": top_events,
             "hourly": hourly,
