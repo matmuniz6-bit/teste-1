@@ -105,7 +105,9 @@ def main():
 
     study_period = long_reversal_study_period_selftest()
     assert study_period["status"] == "ok"
-    assert study_period["data_quality"]["hourly_continuity_ok"] is True
+    assert study_period["coverage"]["complete_trading_dates"] > 0
+    assert study_period["data_quality"]["duplicate_timestamps"] == 0
+    assert study_period["data_quality"]["off_grid_timestamps"] == 0
     print("SMOKE long_reversal_study_period: OK", {
         "coverage": study_period["coverage"],
         "data_quality": study_period["data_quality"],
