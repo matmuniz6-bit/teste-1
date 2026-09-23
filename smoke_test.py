@@ -70,10 +70,20 @@ def main():
     assert lr["strategy"]["no_lookahead"] is True
     assert lr["coverage"]["complete_trading_dates"] >= 28
     assert set(lr["cost_scenarios"].keys()) == {"0", "1", "2"}
+    assert set(lr["benchmark"]["cost_scenarios"].keys()) == {"0", "1", "2"}
+    assert lr["data_quality"]["hourly_continuity_ok"] is True
+    assert lr["data_quality"]["missing_hours"] == 0
+    assert lr["data_quality"]["duplicate_timestamps"] == 0
+    assert lr["data_quality"]["off_grid_timestamps"] == 0
+    for scenario in lr["cost_scenarios"].values():
+        assert "annualized_daily_volatility_pct" in scenario
+    for scenario in lr["benchmark"]["cost_scenarios"].values():
+        assert "annualized_daily_volatility_pct" in scenario
     assert lr["market"]["base"] == "WETH"
     assert lr["market"]["quote"] == "USDC"
     print("SMOKE long_reversal: OK", {
         "coverage": lr["coverage"],
+        "data_quality": lr["data_quality"],
         "benchmark": lr["benchmark"],
         "cost_scenarios": lr["cost_scenarios"],
     })
